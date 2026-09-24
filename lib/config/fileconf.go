@@ -777,6 +777,14 @@ type Auth struct {
 	// with enabled PROXY protocol in front of Teleport you should set it to 'on', if you don't have it, set it to 'off'
 	ProxyProtocol string `yaml:"proxy_protocol,omitempty"`
 
+	// CalloutTo is the WebSocket URL of a proxy that auth connects out to,
+	// for a proxy that cannot dial auth.
+	CalloutTo string `yaml:"callout_to,omitempty"`
+
+	// CalloutKeyFile is the path of the Ed25519 private key, in PEM PKCS #8
+	// form, that signs the callout challenge. It is required with CalloutTo.
+	CalloutKeyFile string `yaml:"callout_key_file,omitempty"`
+
 	// ClusterName is the name of the CA who manages this cluster
 	ClusterName ClusterName `yaml:"cluster_name,omitempty"`
 

@@ -1018,6 +1018,62 @@ func TestApplyDefaultAuthResources(t *testing.T) {
 	require.Equal(t, types.OriginDefaults, cfg.Auth.SessionRecordingConfig.Origin())
 }
 
+func TestApplyAuthCallout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		yaml    string
+		wantURL string
+		wantErr bool
+	}{
+		{
+			name:    "wss",
+			yaml:    "callout_to: wss://teleport.example.com/tunnel/auth\n  callout_key_file: /etc/teleport/callout.pem",
+			wantURL: "wss://teleport.example.com/tunnel/auth",
+			wantErr: false,
+		},
+		{
+			name:    "ws to localhost",
+			yaml:    "callout_to: ws://localhost:8787/tunnel/auth\n  callout_key_file: /etc/teleport/callout.pem",
+			wantURL: "ws://localhost:8787/tunnel/auth",
+			wantErr: false,
+		},
+		{
+			name:    "ws to public host",
+			yaml:    "callout_to: ws://teleport.example.com/tunnel/auth\n  callout_key_file: /etc/teleport/callout.pem",
+			wantErr: true,
+		},
+		{
+			name:    "no key file",
+			yaml:    "callout_to: wss://teleport.example.com/tunnel/auth",
+			wantErr: true,
+		},
+		{
+			name:    "unset",
+			yaml:    "proxy_protocol: off",
+			wantURL: "",
+			wantErr: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conf, err := ReadConfig(bytes.NewBufferString("auth_service:\n  enabled: true\n  " + tc.yaml + "\n"))
+			require.NoError(t, err)
+			cfg := servicecfg.MakeDefaultConfig()
+			err = ApplyFileConfig(conf, cfg)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			if tc.wantURL == "" {
+				require.Nil(t, cfg.Auth.CalloutTo)
+				return
+			}
+			require.Equal(t, tc.wantURL, cfg.Auth.CalloutTo.String())
+			require.Equal(t, "/etc/teleport/callout.pem", cfg.Auth.CalloutKeyFile)
+		})
+	}
+}
+
 // TestApplyCustomAuthPreference makes sure that if the auth file configuration
 // has a `cluster_auth_preference` field, then it will have the origin label as
 // config-file.

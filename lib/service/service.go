@@ -100,6 +100,7 @@ import (
 	"github.com/gravitational/teleport/lib/auth/state"
 	"github.com/gravitational/teleport/lib/auth/storage"
 	"github.com/gravitational/teleport/lib/auth/summarizer"
+	"github.com/gravitational/teleport/lib/authcallout"
 	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/automaticupgrades"
 	autoupdate "github.com/gravitational/teleport/lib/autoupdate/agent"
@@ -2781,6 +2782,23 @@ func (process *TeleportProcess) initAuthService() error {
 		logger.WarnContext(process.ExitContext(), warning)
 	}
 
+	// The callout pool is merged into the listener before the multiplexer,
+	// so pool streams get the same PROXY and TLS handling as TCP conns.
+	var calloutPool *authcallout.Pool
+	if cfg.Auth.CalloutTo != nil {
+		key, err := authcallout.LoadKey(cfg.Auth.CalloutKeyFile)
+		if err != nil {
+			listener.Close()
+			return trace.Wrap(err, "loading auth_service.callout_key_file")
+		}
+		calloutPool, err = authcallout.New(authcallout.Config{URL: cfg.Auth.CalloutTo, Key: key, Logger: logger})
+		if err != nil {
+			listener.Close()
+			return trace.Wrap(err)
+		}
+		listener = authcallout.NewListener(listener, calloutPool)
+	}
+
 	muxCAGetter := func(ctx context.Context, id types.CertAuthID, loadKeys bool) (types.CertAuthority, error) {
 		return authServer.GetCertAuthority(ctx, id, loadKeys)
 	}
@@ -2822,6 +2840,20 @@ func (process *TeleportProcess) initAuthService() error {
 		}
 		tlsServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 	})
+
+	if calloutPool != nil {
+		// Streams accepted before the TLS server serves would wait in the
+		// multiplexer and time out, so the pool starts on AuthTLSReady.
+		process.RegisterFunc("auth.callout", func() error {
+			if _, err := process.WaitForEvent(process.ExitContext(), AuthTLSReady); err != nil {
+				return nil
+			}
+			logger.InfoContext(process.ExitContext(), "Starting auth callout.", "url", cfg.Auth.CalloutTo.Redacted())
+			calloutPool.Start()
+			<-process.ExitContext().Done()
+			return trace.Wrap(calloutPool.Close())
+		})
+	}
 
 	process.RegisterCriticalFunc("auth.tls", func() error {
 		logger.InfoContext(process.ExitContext(), "Auth service is starting.", "version", teleport.Version, "git_ref", teleport.Gitref, "listen_address", authAddr)
