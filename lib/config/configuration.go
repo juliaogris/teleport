@@ -55,6 +55,7 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	gcputils "github.com/gravitational/teleport/api/utils/gcp"
 	"github.com/gravitational/teleport/lib"
+	"github.com/gravitational/teleport/lib/authcallout"
 	"github.com/gravitational/teleport/lib/automaticupgrades"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/lite"
@@ -916,6 +917,21 @@ func applyAuthConfig(fc *FileConfig, cfg *servicecfg.Config) error {
 		}
 
 		cfg.Auth.PROXYProtocolMode = val
+	}
+
+	if fc.Auth.CalloutTo != "" {
+		u, err := url.Parse(fc.Auth.CalloutTo)
+		if err != nil {
+			return trace.BadParameter("auth_service.callout_to: %v", err)
+		}
+		if err := authcallout.CheckURL(u); err != nil {
+			return trace.Wrap(err, "auth_service.callout_to")
+		}
+		if fc.Auth.CalloutKeyFile == "" {
+			return trace.BadParameter("auth_service.callout_key_file is required with callout_to")
+		}
+		cfg.Auth.CalloutTo = u
+		cfg.Auth.CalloutKeyFile = fc.Auth.CalloutKeyFile
 	}
 
 	if fc.Auth.ListenAddress != "" {

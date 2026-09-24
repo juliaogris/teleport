@@ -19,6 +19,7 @@
 package servicecfg
 
 import (
+	"net/url"
 	"slices"
 	"time"
 
@@ -45,6 +46,14 @@ type AuthConfig struct {
 
 	// ListenAddr is the listening address of the auth service
 	ListenAddr utils.NetAddr
+
+	// CalloutTo is the WebSocket URL of a proxy that auth connects out to.
+	// If nil, auth only listens.
+	CalloutTo *url.URL
+
+	// CalloutKeyFile is the path of the Ed25519 key that signs the callout
+	// challenge.
+	CalloutKeyFile string
 
 	// Authorities is a set of trusted certificate authorities
 	// that will be added by this auth server on the first start
