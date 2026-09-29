@@ -27,7 +27,7 @@
 //
 // -user-identity is the prefix of the files `tctl auth sign --format=tls`
 // writes. -proxy-identity is a directory written by proxymint. The output
-// directory receives app.crt, app.key and session-id.
+// directory receives app.crt, app.key, session-id and bearer-token.
 package main
 
 import (
@@ -110,9 +110,10 @@ func run(authAddr, userIdentity, proxyIdentity, user, app, publicAddr, cluster, 
 		return err
 	}
 	files := map[string][]byte{
-		"app.crt":    session.GetTLSCert(),
-		"app.key":    session.GetTLSPriv(),
-		"session-id": []byte(session.GetName() + "\n"),
+		"app.crt":      session.GetTLSCert(),
+		"app.key":      session.GetTLSPriv(),
+		"session-id":   []byte(session.GetName() + "\n"),
+		"bearer-token": []byte(session.GetBearerToken() + "\n"),
 	}
 	for name, data := range files {
 		if err := os.WriteFile(filepath.Join(out, name), data, 0o600); err != nil {
