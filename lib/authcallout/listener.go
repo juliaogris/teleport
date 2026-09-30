@@ -17,6 +17,7 @@
 package authcallout
 
 import (
+	"errors"
 	"net"
 	"sync"
 )
@@ -51,6 +52,9 @@ func NewListener(l net.Listener, pool *Pool) net.Listener {
 	return ml
 }
 
+// acceptTCP forwards every Accept result of the TCP listener until the
+// listener is closed. Other errors, such as EMFILE, are forwarded and the
+// loop goes on.
 func (l *listener) acceptTCP() {
 	for {
 		c, err := l.Listener.Accept()
@@ -62,7 +66,7 @@ func (l *listener) acceptTCP() {
 			}
 			return
 		}
-		if err != nil {
+		if errors.Is(err, net.ErrClosed) {
 			return
 		}
 	}

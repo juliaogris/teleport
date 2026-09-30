@@ -23,6 +23,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -386,4 +387,65 @@ func TestListenerMergesPoolAndTCP(t *testing.T) {
 	require.NoError(t, l.Close())
 	_, err = l.Accept()
 	require.ErrorIs(t, err, net.ErrClosed)
+}
+
+// scriptedListener returns the Accept results a test feeds it.
+type scriptedListener struct {
+	results chan acceptResult
+	closed  chan struct{}
+}
+
+func (l *scriptedListener) Accept() (net.Conn, error) {
+	select {
+	case r := <-l.results:
+		return r.conn, r.err
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *scriptedListener) Close() error {
+	close(l.closed)
+	return nil
+}
+
+func (l *scriptedListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+func TestListenerKeepsAcceptingAfterTCPError(t *testing.T) {
+	pub, priv := newKey(t)
+	hub := newFakeHub(t, pub)
+	p := newPool(t, hub.url(t), priv, 1)
+	tcp := &scriptedListener{results: make(chan acceptResult, 2), closed: make(chan struct{})}
+	l := NewListener(tcp, p)
+	t.Cleanup(func() { l.Close() })
+
+	accept := func() (net.Conn, error) {
+		type result struct {
+			conn net.Conn
+			err  error
+		}
+		got := make(chan result, 1)
+		go func() {
+			c, err := l.Accept()
+			got <- result{c, err}
+		}()
+		select {
+		case r := <-got:
+			return r.conn, r.err
+		case <-time.After(2 * time.Second):
+			t.Fatal("Accept did not return")
+			return nil, nil
+		}
+	}
+
+	tcp.results <- acceptResult{err: errors.New("accept tcp: too many open files")}
+	_, err := accept()
+	require.ErrorContains(t, err, "too many open files")
+
+	client, server := net.Pipe()
+	t.Cleanup(func() { client.Close() })
+	tcp.results <- acceptResult{conn: server}
+	c, err := accept()
+	require.NoError(t, err)
+	require.Same(t, server, c)
 }
