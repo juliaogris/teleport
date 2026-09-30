@@ -49,6 +49,7 @@ import (
 	"log/slog"
 	mathrand "math/rand/v2"
 	"net"
+	"net/http"
 	"net/http/httptrace"
 	"net/netip"
 	"net/url"
@@ -69,6 +70,7 @@ const (
 	NonceSize = 32
 
 	challengeTimeout      = 10 * time.Second
+	defaultDialTimeout    = 30 * time.Second
 	defaultSize           = 8
 	defaultDialsPerMinute = 60
 	// readLimit is larger than any message the proxy writes. A message is
@@ -88,6 +90,8 @@ type Config struct {
 	Size int
 	// DialsPerMinute caps new WebSockets across the pool. The default is 60.
 	DialsPerMinute int
+	// DialTimeout bounds the WebSocket handshake. The default is 30 seconds.
+	DialTimeout time.Duration
 	// Logger is the logger. If not set, the pool uses [slog.Default].
 	Logger *slog.Logger
 }
@@ -108,6 +112,9 @@ func (c *Config) CheckAndSetDefaults() error {
 	}
 	if c.DialsPerMinute <= 0 {
 		c.DialsPerMinute = defaultDialsPerMinute
+	}
+	if c.DialTimeout <= 0 {
+		c.DialTimeout = defaultDialTimeout
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -271,6 +278,14 @@ func (p *Pool) run() {
 	}
 }
 
+// noRedirectClient refuses redirects, so the URL that [CheckURL] accepted is
+// the only one the pool dials.
+var noRedirectClient = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 // serveOne dials one WebSocket, answers the challenge, and hands the stream
 // to Accept after the proxy's first data message. It returns nil once a
 // handed-over stream closes.
@@ -279,7 +294,9 @@ func (p *Pool) serveOne(log *slog.Logger) error {
 	clientTrace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
 		local, remote = info.Conn.LocalAddr(), info.Conn.RemoteAddr()
 	}}
-	ws, _, err := websocket.Dial(httptrace.WithClientTrace(p.dialCtx, clientTrace), p.cfg.URL.String(), nil)
+	ctx, cancel := context.WithTimeout(httptrace.WithClientTrace(p.dialCtx, clientTrace), p.cfg.DialTimeout)
+	ws, _, err := websocket.Dial(ctx, p.cfg.URL.String(), &websocket.DialOptions{HTTPClient: noRedirectClient})
+	cancel()
 	if err != nil {
 		return trace.Wrap(err, "dialing")
 	}

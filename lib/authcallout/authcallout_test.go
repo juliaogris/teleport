@@ -219,6 +219,49 @@ func TestPoolReplacesRejectedSignature(t *testing.T) {
 	require.Empty(t, hub.verified)
 }
 
+func TestPoolDoesNotFollowRedirects(t *testing.T) {
+	pub, priv := newKey(t)
+	hub := newFakeHub(t, pub)
+	var redirects atomic.Int32
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirects.Add(1)
+		http.Redirect(w, r, hub.srv.URL+"/tunnel/auth", http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+	u, err := url.Parse("ws" + strings.TrimPrefix(redirector.URL, "http") + "/tunnel/auth")
+	require.NoError(t, err)
+
+	newPool(t, u, priv, 1)
+	require.Eventually(t, func() bool { return redirects.Load() >= 2 }, 5*time.Second, 10*time.Millisecond)
+	require.Zero(t, hub.dials.Load())
+}
+
+func TestPoolDialTimesOut(t *testing.T) {
+	_, priv := newKey(t)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { l.Close() })
+	accepted := make(chan net.Conn, 64)
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { c.Close() })
+			accepted <- c
+		}
+	}()
+	u, err := url.Parse("ws://" + l.Addr().String() + "/tunnel/auth")
+	require.NoError(t, err)
+
+	p, err := New(Config{URL: u, Key: priv, Size: 1, DialsPerMinute: 6000, DialTimeout: 100 * time.Millisecond})
+	require.NoError(t, err)
+	p.Start()
+	t.Cleanup(func() { p.Close() })
+	require.Eventually(t, func() bool { return len(accepted) >= 2 }, 5*time.Second, 10*time.Millisecond)
+}
+
 func TestPoolRejectsServerChosenCompression(t *testing.T) {
 	_, priv := newKey(t)
 	// The hub sends the nonce right after the handshake. A client that
