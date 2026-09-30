@@ -314,6 +314,37 @@ func TestConnCloseBreaksBlockedWrite(t *testing.T) {
 	}
 }
 
+func TestPoolStopKeepsAcceptedStreams(t *testing.T) {
+	pub, priv := newKey(t)
+	hub := newFakeHub(t, pub)
+	p := newPool(t, hub.url(t), priv, 2)
+	used, idle := hub.next(t), hub.next(t)
+	c := acceptStream(t, p, used, "x")
+
+	p.Stop()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, _, err := idle.Read(ctx)
+	require.Error(t, err, "Stop left an idle WebSocket open")
+	_, err = p.Accept()
+	require.ErrorIs(t, err, net.ErrClosed)
+
+	_, err = c.Write([]byte("still open"))
+	require.NoError(t, err)
+	_, got, err := used.Read(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "still open", string(got))
+
+	// The hub reads so that it answers the close frame.
+	go used.Read(ctx)
+	require.NoError(t, c.Close())
+	select {
+	case <-hub.verified:
+		t.Fatal("pool dialed after Stop")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 func TestPoolCloseClosesAll(t *testing.T) {
 	pub, priv := newKey(t)
 	hub := newFakeHub(t, pub)

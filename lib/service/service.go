@@ -2874,14 +2874,18 @@ func (process *TeleportProcess) initAuthService() error {
 	if calloutPool != nil {
 		// Streams accepted before the TLS server serves would wait in the
 		// multiplexer and time out, so the pool starts on AuthTLSReady.
+		// On a graceful exit the pool stops taking new streams from the
+		// proxy at once. auth.shutdown closes the accepted streams with
+		// the TLS server.
 		process.RegisterFunc("auth.callout", func() error {
-			if _, err := process.WaitForEvent(process.ExitContext(), AuthTLSReady); err != nil {
+			if _, err := process.WaitForEvent(process.GracefulExitContext(), AuthTLSReady); err != nil {
 				return nil
 			}
 			logger.InfoContext(process.ExitContext(), "Starting auth callout.", "url", cfg.Auth.CalloutTo.Redacted())
 			calloutPool.Start()
-			<-process.ExitContext().Done()
-			return trace.Wrap(calloutPool.Close())
+			<-process.GracefulExitContext().Done()
+			calloutPool.Stop()
+			return nil
 		})
 	}
 
@@ -3127,6 +3131,9 @@ func (process *TeleportProcess) initAuthService() error {
 					logger.WarnContext(ctx, "Error while gracefully stopping usage reporter.", "error", err)
 				}
 			}
+		}
+		if calloutPool != nil {
+			warnOnErr(process.ExitContext(), calloutPool.Close(), logger)
 		}
 		logger.InfoContext(process.ExitContext(), "Exited.")
 	})

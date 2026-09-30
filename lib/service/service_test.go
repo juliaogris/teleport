@@ -20,13 +20,18 @@ package service
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -35,6 +40,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
@@ -64,6 +70,7 @@ import (
 	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/auth/authtest"
 	"github.com/gravitational/teleport/lib/auth/storage"
+	"github.com/gravitational/teleport/lib/authcallout"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/memory"
 	"github.com/gravitational/teleport/lib/cloud/imds"
@@ -2854,4 +2861,109 @@ func TestAgentPinsCheck(t *testing.T) {
 			tt.assertErr(t, checkScopedAppJoin(tt.conn))
 		})
 	}
+}
+
+// calloutHub is the proxy side of the auth callout. It verifies each
+// WebSocket against pub and hands it to verified.
+func calloutHub(t *testing.T, pub ed25519.PublicKey, verified chan<- *websocket.Conn) *url.URL {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		ctx := context.Background()
+		nonce := make([]byte, authcallout.NonceSize)
+		rand.Read(nonce)
+		if err := ws.Write(ctx, websocket.MessageBinary, nonce); err != nil {
+			ws.CloseNow()
+			return
+		}
+		_, reply, err := ws.Read(ctx)
+		if err != nil || len(reply) != authcallout.NonceSize+ed25519.SignatureSize {
+			ws.CloseNow()
+			return
+		}
+		msg := authcallout.SignedMessage(r.Host, nonce, reply[:authcallout.NonceSize])
+		if !ed25519.Verify(pub, msg, reply[authcallout.NonceSize:]) {
+			ws.CloseNow()
+			return
+		}
+		verified <- ws
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse("ws" + strings.TrimPrefix(srv.URL, "http") + "/tunnel/auth")
+	require.NoError(t, err)
+	return u
+}
+
+func TestAuthCalloutServesTLSAndStopsOnShutdown(t *testing.T) {
+	t.Parallel()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(priv)
+	require.NoError(t, err)
+	keyPath := filepath.Join(t.TempDir(), "callout.pem")
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})
+	require.NoError(t, os.WriteFile(keyPath, keyPEM, 0o600))
+	verified := make(chan *websocket.Conn, 64)
+
+	dataDir := makeTempDir(t)
+	cfg := servicecfg.MakeDefaultConfig()
+	cfg.DataDir = dataDir
+	cfg.SetAuthServerAddress(utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"})
+	cfg.Auth.Enabled = true
+	cfg.Proxy.Enabled = false
+	cfg.SSH.Enabled = false
+	cfg.DebugService.Enabled = false
+	cfg.Auth.StorageConfig.Params["path"] = dataDir
+	cfg.Auth.ListenAddr = utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"}
+	cfg.Auth.CalloutTo = calloutHub(t, pub, verified)
+	cfg.Auth.CalloutKeyFile = keyPath
+	cfg.CircuitBreakerConfig = breaker.NoopBreakerConfig()
+
+	process, err := NewTeleport(cfg)
+	require.NoError(t, err)
+	require.NoError(t, process.Start())
+	t.Cleanup(func() {
+		process.Close()
+		process.Wait()
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	_, err = process.WaitForEvent(ctx, AuthTLSReady)
+	require.NoError(t, err)
+	next := func() *websocket.Conn {
+		select {
+		case ws := <-verified:
+			t.Cleanup(func() { ws.CloseNow() })
+			return ws
+		case <-ctx.Done():
+			t.Fatal("no callout WebSocket within 30s")
+			return nil
+		}
+	}
+	used, idle := next(), next()
+
+	// The first message on a stream reaches the auth TLS server.
+	tlsConn := tls.Client(websocket.NetConn(ctx, used, websocket.MessageBinary), &tls.Config{InsecureSkipVerify: true})
+	require.NoError(t, tlsConn.HandshakeContext(ctx))
+	leaf := tlsConn.ConnectionState().PeerCertificates[0]
+	require.Contains(t, leaf.DNSNames, "teleport.cluster.local")
+
+	// Shutdown with a context that never ends must still return.
+	done := make(chan struct{})
+	go func() {
+		process.Shutdown(t.Context())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Shutdown did not return, the callout pool kept the process alive")
+	}
+	readCtx, cancelRead := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelRead()
+	_, _, err = idle.Read(readCtx)
+	require.Error(t, err, "Shutdown left an idle callout WebSocket open")
 }

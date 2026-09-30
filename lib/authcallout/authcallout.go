@@ -176,10 +176,13 @@ type Pool struct {
 	limiter *rate.Limiter
 	conns   chan net.Conn
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	start  sync.Once
-	wg     sync.WaitGroup
+	// ctx ends on Close. dialCtx ends on Stop and Close.
+	ctx     context.Context
+	cancel  context.CancelFunc
+	dialCtx context.Context
+	stop    context.CancelFunc
+	start   sync.Once
+	wg      sync.WaitGroup
 }
 
 // New returns a pool that does not dial until [Pool.Start].
@@ -188,6 +191,7 @@ func New(cfg Config) (*Pool, error) {
 		return nil, trace.Wrap(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	dialCtx, stop := context.WithCancel(ctx)
 	return &Pool{
 		cfg: cfg,
 		// A burst of Size lets the first fill dial without waiting.
@@ -195,6 +199,8 @@ func New(cfg Config) (*Pool, error) {
 		conns:   make(chan net.Conn),
 		ctx:     ctx,
 		cancel:  cancel,
+		dialCtx: dialCtx,
+		stop:    stop,
 	}, nil
 }
 
@@ -209,38 +215,44 @@ func (p *Pool) Start() {
 }
 
 // Accept returns the next stream the proxy has started to use. It returns
-// [net.ErrClosed] after [Pool.Close].
+// [net.ErrClosed] after [Pool.Stop] or [Pool.Close].
 func (p *Pool) Accept() (net.Conn, error) {
 	select {
 	case c := <-p.conns:
 		return c, nil
-	case <-p.ctx.Done():
+	case <-p.dialCtx.Done():
 		return nil, net.ErrClosed
 	}
 }
 
-// Close closes every WebSocket, including streams returned by Accept, and
-// waits for the pool to stop.
+// Stop stops dialing and closes every WebSocket not yet returned by Accept.
+// Streams returned by Accept stay open until their owner closes them.
+func (p *Pool) Stop() {
+	p.stop()
+}
+
+// Close stops the pool, closes the streams returned by Accept, and waits
+// for the pool's goroutines to exit.
 func (p *Pool) Close() error {
 	p.cancel()
 	p.wg.Wait()
 	return nil
 }
 
-// run keeps one WebSocket open until the pool closes.
+// run keeps one WebSocket open until the pool stops.
 func (p *Pool) run() {
 	defer p.wg.Done()
 	log := p.cfg.Logger.With("url", p.cfg.URL.Redacted())
 	var backoff time.Duration
 	for {
 		if !p.limiter.Allow() {
-			log.WarnContext(p.ctx, "auth callout: dial rate limit reached", "dials_per_minute", p.cfg.DialsPerMinute)
-			if err := p.limiter.Wait(p.ctx); err != nil {
+			log.WarnContext(p.dialCtx, "auth callout: dial rate limit reached", "dials_per_minute", p.cfg.DialsPerMinute)
+			if err := p.limiter.Wait(p.dialCtx); err != nil {
 				return
 			}
 		}
 		err := p.serveOne(log)
-		if p.ctx.Err() != nil {
+		if p.dialCtx.Err() != nil {
 			return
 		}
 		if err == nil {
@@ -250,10 +262,10 @@ func (p *Pool) run() {
 		backoff = min(max(2*backoff, minBackoff), maxBackoff)
 		// Jitter spreads the redials when the proxy drops every WebSocket.
 		wait := backoff/2 + mathrand.N(backoff/2)
-		log.DebugContext(p.ctx, "auth callout: stream failed", "error", err, "retry_in", wait)
+		log.DebugContext(p.dialCtx, "auth callout: stream failed", "error", err, "retry_in", wait)
 		select {
 		case <-time.After(wait):
-		case <-p.ctx.Done():
+		case <-p.dialCtx.Done():
 			return
 		}
 	}
@@ -267,21 +279,21 @@ func (p *Pool) serveOne(log *slog.Logger) error {
 	clientTrace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
 		local, remote = info.Conn.LocalAddr(), info.Conn.RemoteAddr()
 	}}
-	ws, _, err := websocket.Dial(httptrace.WithClientTrace(p.ctx, clientTrace), p.cfg.URL.String(), nil)
+	ws, _, err := websocket.Dial(httptrace.WithClientTrace(p.dialCtx, clientTrace), p.cfg.URL.String(), nil)
 	if err != nil {
 		return trace.Wrap(err, "dialing")
 	}
 	defer ws.CloseNow()
 	ws.SetReadLimit(readLimit)
-	log.DebugContext(p.ctx, "auth callout: dialed")
+	log.DebugContext(p.dialCtx, "auth callout: dialed")
 
 	if err := p.answerChallenge(ws); err != nil {
 		return trace.Wrap(err, "challenge")
 	}
-	log.DebugContext(p.ctx, "auth callout: challenge signed")
+	log.DebugContext(p.dialCtx, "auth callout: challenge signed")
 
 	// The stream has no deadline here. It idles until the proxy uses it.
-	typ, first, err := ws.Read(p.ctx)
+	typ, first, err := ws.Read(p.dialCtx)
 	if err != nil {
 		return trace.Wrap(err, "waiting for first message")
 	}
@@ -289,10 +301,11 @@ func (p *Pool) serveOne(log *slog.Logger) error {
 		return trace.BadParameter("first message is not binary")
 	}
 
+	// Accepted streams outlive Stop, so the conn takes ctx, not dialCtx.
 	conn := newConn(p.ctx, ws, first, local, remote)
 	select {
 	case p.conns <- conn:
-	case <-p.ctx.Done():
+	case <-p.dialCtx.Done():
 		conn.Close()
 		return nil
 	}
@@ -308,7 +321,7 @@ func (p *Pool) serveOne(log *slog.Logger) error {
 // answerChallenge reads the proxy nonce and writes the auth nonce and the
 // signature.
 func (p *Pool) answerChallenge(ws *websocket.Conn) error {
-	ctx, cancel := context.WithTimeout(p.ctx, challengeTimeout)
+	ctx, cancel := context.WithTimeout(p.dialCtx, challengeTimeout)
 	defer cancel()
 	typ, proxyNonce, err := ws.Read(ctx)
 	if err != nil {
