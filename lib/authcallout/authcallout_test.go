@@ -17,8 +17,13 @@
 package authcallout
 
 import (
+	"bytes"
+	"compress/flate"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -28,7 +33,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
 )
 
@@ -43,27 +48,27 @@ type fakeHub struct {
 
 func newFakeHub(t *testing.T, pub ed25519.PublicKey) *fakeHub {
 	h := &fakeHub{pub: pub, verified: make(chan *websocket.Conn, 64)}
-	upgrader := websocket.Upgrader{}
+	ctx := t.Context()
 	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.dials.Add(1)
-		ws, err := upgrader.Upgrade(w, r, nil)
+		ws, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
 		nonce := make([]byte, NonceSize)
 		rand.Read(nonce)
-		if err := ws.WriteMessage(websocket.BinaryMessage, nonce); err != nil {
-			ws.Close()
+		if err := ws.Write(ctx, websocket.MessageBinary, nonce); err != nil {
+			ws.CloseNow()
 			return
 		}
-		_, reply, err := ws.ReadMessage()
+		_, reply, err := ws.Read(ctx)
 		if err != nil || len(reply) != NonceSize+ed25519.SignatureSize {
-			ws.Close()
+			ws.CloseNow()
 			return
 		}
 		msg := SignedMessage(r.Host, nonce, reply[:NonceSize])
 		if !ed25519.Verify(h.pub, msg, reply[NonceSize:]) {
-			ws.Close()
+			ws.CloseNow()
 			return
 		}
 		h.verified <- ws
@@ -81,7 +86,7 @@ func (h *fakeHub) url(t *testing.T) *url.URL {
 func (h *fakeHub) next(t *testing.T) *websocket.Conn {
 	select {
 	case ws := <-h.verified:
-		t.Cleanup(func() { ws.Close() })
+		t.Cleanup(func() { ws.CloseNow() })
 		return ws
 	case <-time.After(5 * time.Second):
 		t.Fatal("no verified WebSocket within 5s")
@@ -103,103 +108,14 @@ func newPool(t *testing.T, u *url.URL, key ed25519.PrivateKey, size int) *Pool {
 	return p
 }
 
-func TestPoolOpensSize(t *testing.T) {
-	pub, priv := newKey(t)
-	hub := newFakeHub(t, pub)
-	newPool(t, hub.url(t), priv, 3)
-	for range 3 {
-		hub.next(t)
-	}
-	select {
-	case <-hub.verified:
-		t.Fatal("pool opened more WebSockets than its size")
-	case <-time.After(200 * time.Millisecond):
-	}
-}
-
-func TestPoolFirstByteAndEcho(t *testing.T) {
-	pub, priv := newKey(t)
-	hub := newFakeHub(t, pub)
-	p := newPool(t, hub.url(t), priv, 1)
-	ws := hub.next(t)
-
-	require.NoError(t, ws.WriteMessage(websocket.BinaryMessage, []byte("hello")))
+// acceptStream has the hub start a stream with first and returns the
+// stream from p.Accept.
+func acceptStream(t *testing.T, p *Pool, ws *websocket.Conn, first string) net.Conn {
+	require.NoError(t, ws.Write(t.Context(), websocket.MessageBinary, []byte(first)))
 	c, err := p.Accept()
 	require.NoError(t, err)
-	buf := make([]byte, 5)
-	_, err = c.Read(buf)
-	require.NoError(t, err)
-	require.Equal(t, "hello", string(buf))
-
-	_, err = c.Write([]byte("world"))
-	require.NoError(t, err)
-	_, got, err := ws.ReadMessage()
-	require.NoError(t, err)
-	require.Equal(t, "world", string(got))
-
-	_, ok := c.RemoteAddr().(*net.TCPAddr)
-	require.True(t, ok)
-}
-
-func TestPoolReplacesClosedStream(t *testing.T) {
-	pub, priv := newKey(t)
-	hub := newFakeHub(t, pub)
-	newPool(t, hub.url(t), priv, 1)
-	hub.next(t).Close()
-	hub.next(t)
-}
-
-func TestPoolReplacesRejectedSignature(t *testing.T) {
-	pub, _ := newKey(t)
-	_, wrong := newKey(t)
-	hub := newFakeHub(t, pub)
-	newPool(t, hub.url(t), wrong, 1)
-	require.Eventually(t, func() bool { return hub.dials.Load() >= 2 }, 5*time.Second, 10*time.Millisecond)
-	require.Empty(t, hub.verified)
-}
-
-func TestPoolCloseClosesAll(t *testing.T) {
-	pub, priv := newKey(t)
-	hub := newFakeHub(t, pub)
-	p, err := New(Config{URL: hub.url(t), Key: priv, Size: 2})
-	require.NoError(t, err)
-	p.Start()
-	a, b := hub.next(t), hub.next(t)
-
-	require.NoError(t, p.Close())
-	for _, ws := range []*websocket.Conn{a, b} {
-		ws.SetReadDeadline(time.Now().Add(5 * time.Second))
-		_, _, err := ws.ReadMessage()
-		require.Error(t, err)
-	}
-	_, err = p.Accept()
-	require.ErrorIs(t, err, net.ErrClosed)
-}
-
-func TestListenerMergesPoolAndTCP(t *testing.T) {
-	pub, priv := newKey(t)
-	hub := newFakeHub(t, pub)
-	p := newPool(t, hub.url(t), priv, 1)
-	tcp, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	l := NewListener(tcp, p)
-	t.Cleanup(func() { l.Close() })
-
-	require.NoError(t, hub.next(t).WriteMessage(websocket.BinaryMessage, []byte("x")))
-	c, err := l.Accept()
-	require.NoError(t, err)
-	require.IsType(t, &conn{}, c)
-
-	d, err := net.Dial("tcp", tcp.Addr().String())
-	require.NoError(t, err)
-	t.Cleanup(func() { d.Close() })
-	c, err = l.Accept()
-	require.NoError(t, err)
-	require.IsType(t, &net.TCPConn{}, c)
-
-	require.NoError(t, l.Close())
-	_, err = l.Accept()
-	require.ErrorIs(t, err, net.ErrClosed)
+	t.Cleanup(func() { c.Close() })
+	return c
 }
 
 func TestCheckURL(t *testing.T) {
@@ -226,4 +142,217 @@ func TestCheckURL(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestPoolOpensSize(t *testing.T) {
+	pub, priv := newKey(t)
+	hub := newFakeHub(t, pub)
+	newPool(t, hub.url(t), priv, 3)
+	for range 3 {
+		hub.next(t)
+	}
+	select {
+	case <-hub.verified:
+		t.Fatal("pool opened more WebSockets than its size")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestPoolFirstByteAndEcho(t *testing.T) {
+	pub, priv := newKey(t)
+	hub := newFakeHub(t, pub)
+	p := newPool(t, hub.url(t), priv, 1)
+	ws := hub.next(t)
+	c := acceptStream(t, p, ws, "hello")
+	require.NoError(t, ws.Write(t.Context(), websocket.MessageBinary, []byte("world")))
+
+	var got []byte
+	buf := make([]byte, 3)
+	for len(got) < len("helloworld") {
+		n, err := c.Read(buf)
+		require.NoError(t, err)
+		got = append(got, buf[:n]...)
+	}
+	require.Equal(t, "helloworld", string(got))
+
+	_, err := c.Write([]byte("back"))
+	require.NoError(t, err)
+	_, reply, err := ws.Read(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "back", string(reply))
+
+	require.IsType(t, &net.TCPAddr{}, c.RemoteAddr())
+	require.IsType(t, &net.TCPAddr{}, c.LocalAddr())
+
+	go ws.Close(websocket.StatusNormalClosure, "")
+	_, err = c.Read(buf)
+	require.ErrorIs(t, err, io.EOF)
+}
+
+func TestPoolReplacesStreamClosedBeforeFirstMessage(t *testing.T) {
+	pub, priv := newKey(t)
+	hub := newFakeHub(t, pub)
+	newPool(t, hub.url(t), priv, 1)
+	hub.next(t).CloseNow()
+	hub.next(t)
+}
+
+func TestPoolReplacesAcceptedStream(t *testing.T) {
+	pub, priv := newKey(t)
+	hub := newFakeHub(t, pub)
+	p := newPool(t, hub.url(t), priv, 1)
+	ws := hub.next(t)
+	c := acceptStream(t, p, ws, "x")
+	// The hub reads so that it answers the close frame.
+	go ws.Read(t.Context())
+	require.NoError(t, c.Close())
+	hub.next(t)
+}
+
+func TestPoolReplacesRejectedSignature(t *testing.T) {
+	pub, _ := newKey(t)
+	_, wrong := newKey(t)
+	hub := newFakeHub(t, pub)
+	newPool(t, hub.url(t), wrong, 1)
+	require.Eventually(t, func() bool { return hub.dials.Load() >= 2 }, 5*time.Second, 10*time.Millisecond)
+	require.Empty(t, hub.verified)
+}
+
+func TestPoolRejectsServerChosenCompression(t *testing.T) {
+	_, priv := newKey(t)
+	// The hub sends the nonce right after the handshake. A client that
+	// accepts the compression answers it. A rejected dial reads up to 1 KiB
+	// of the body before it closes, so a padding frame keeps the test short.
+	var tail bytes.Buffer
+	writeFrame(t, &tail, false, opcodeBinary, make([]byte, NonceSize))
+	writeFrame(t, &tail, false, opcodeBinary, make([]byte, 1024))
+	extension := "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n"
+	hub := newRawHub(t, extension, tail.Bytes())
+	newPool(t, hub.url(t), priv, 1)
+
+	c := hub.next(t)
+	n, err := c.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "the pool sent bytes on a WebSocket with compression it did not offer")
+	require.Zero(t, n)
+	hub.next(t)
+}
+
+func TestPoolRejectsCompressedFrame(t *testing.T) {
+	_, priv := newKey(t)
+	hub := newRawHub(t, "", nil)
+	p := newPool(t, hub.url(t), priv, 1)
+
+	c := hub.next(t)
+	writeFrame(t, c, false, opcodeBinary, make([]byte, NonceSize))
+	opcode, reply := readFrame(t, c)
+	require.Equal(t, byte(opcodeBinary), opcode)
+	require.Len(t, reply, NonceSize+ed25519.SignatureSize)
+
+	// One MiB of zeros deflates to about 1 KiB.
+	var deflated bytes.Buffer
+	zw, err := flate.NewWriter(&deflated, flate.BestCompression)
+	require.NoError(t, err)
+	_, err = zw.Write(make([]byte, 1<<20))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	require.Less(t, deflated.Len(), readLimit)
+	writeFrame(t, c, true, opcodeBinary, deflated.Bytes())
+
+	opcode, payload := readFrame(t, c)
+	require.Equal(t, byte(opcodeClose), opcode)
+	require.Equal(t, uint16(websocket.StatusProtocolError), binary.BigEndian.Uint16(payload))
+	select {
+	case <-p.conns:
+		t.Fatal("pool accepted a stream whose first frame was compressed")
+	default:
+	}
+	hub.next(t)
+}
+
+func TestConnCloseBreaksBlockedWrite(t *testing.T) {
+	pub, priv := newKey(t)
+	hub := newFakeHub(t, pub)
+	p := newPool(t, hub.url(t), priv, 1)
+	c := acceptStream(t, p, hub.next(t), "x")
+
+	// The hub never reads, so writes stall once the socket buffers fill.
+	var written atomic.Int64
+	writeErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := c.Write(buf)
+			written.Add(int64(n))
+			if err != nil {
+				writeErr <- err
+				return
+			}
+		}
+	}()
+	stalled := func() bool {
+		before := written.Load()
+		time.Sleep(50 * time.Millisecond)
+		return before > 0 && written.Load() == before
+	}
+	require.Eventually(t, stalled, 10*time.Second, 10*time.Millisecond)
+
+	closed := make(chan struct{})
+	go func() {
+		c.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close waited behind the blocked Write")
+	}
+	select {
+	case err := <-writeErr:
+		require.Error(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Write did not return after Close")
+	}
+}
+
+func TestPoolCloseClosesAll(t *testing.T) {
+	pub, priv := newKey(t)
+	hub := newFakeHub(t, pub)
+	p := newPool(t, hub.url(t), priv, 2)
+	a, b := hub.next(t), hub.next(t)
+
+	require.NoError(t, p.Close())
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	for _, ws := range []*websocket.Conn{a, b} {
+		_, _, err := ws.Read(ctx)
+		require.Error(t, err)
+	}
+	_, err := p.Accept()
+	require.ErrorIs(t, err, net.ErrClosed)
+}
+
+func TestListenerMergesPoolAndTCP(t *testing.T) {
+	pub, priv := newKey(t)
+	hub := newFakeHub(t, pub)
+	p := newPool(t, hub.url(t), priv, 1)
+	tcp, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	l := NewListener(tcp, p)
+	t.Cleanup(func() { l.Close() })
+
+	require.NoError(t, hub.next(t).Write(t.Context(), websocket.MessageBinary, []byte("x")))
+	c, err := l.Accept()
+	require.NoError(t, err)
+	require.IsType(t, &conn{}, c)
+
+	d, err := net.Dial("tcp", tcp.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	c, err = l.Accept()
+	require.NoError(t, err)
+	require.IsType(t, &net.TCPConn{}, c)
+
+	require.NoError(t, l.Close())
+	_, err = l.Accept()
+	require.ErrorIs(t, err, net.ErrClosed)
 }

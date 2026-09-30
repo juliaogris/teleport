@@ -22,15 +22,21 @@
 //
 //  1. The proxy sends a 32-byte nonce as the first message.
 //  2. Auth replies with its own 32-byte nonce and an Ed25519 signature over
-//     "sallyport/authpipe/v1", the URL host, the proxy nonce and the auth
-//     nonce, in that order.
+//     "sallyport/authpipe/v1", the URL's Host field (host and port), the
+//     proxy nonce and the auth nonce, in that order.
 //  3. The stream waits until the proxy sends its first data message. The
 //     pool then yields the stream from [Pool.Accept] as a [net.Conn], with
 //     that message in front of it.
 //
-// The pool opens a new WebSocket when a stream closes. The bytes on a stream
-// are the proxy's TLS to auth. The pool does no TLS of its own on ws://
-// URLs, and does not authenticate the proxy.
+// The pool opens a new WebSocket when a stream closes. The bytes on a
+// stream are TLS to auth, from the proxy or from a client the proxy pipes
+// through. On ws:// URLs the pool does no TLS of its own. On wss:// URLs
+// the dialer checks the proxy's certificate against the system roots. The
+// pool never checks the proxy's Teleport identity.
+//
+// The pool never offers WebSocket compression and rejects a proxy that
+// switches it on. Every message is read through a size limit that counts
+// the bytes after any inflation.
 package authcallout
 
 import (
@@ -43,13 +49,14 @@ import (
 	"log/slog"
 	mathrand "math/rand/v2"
 	"net"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/coder/websocket"
 	"github.com/gravitational/trace"
 	"golang.org/x/time/rate"
 )
@@ -66,10 +73,9 @@ const (
 	defaultDialsPerMinute = 60
 	// readLimit is larger than any message the proxy writes. A message is
 	// one or more TLS records.
-	readLimit      = 128 * 1024
-	minBackoff     = 250 * time.Millisecond
-	maxBackoff     = 30 * time.Second
-	closeWriteWait = time.Second
+	readLimit  = 128 * 1024
+	minBackoff = 250 * time.Millisecond
+	maxBackoff = 30 * time.Second
 )
 
 // Config is the configuration for a [Pool].
@@ -82,8 +88,6 @@ type Config struct {
 	Size int
 	// DialsPerMinute caps new WebSockets across the pool. The default is 60.
 	DialsPerMinute int
-	// Dialer dials the WebSockets. The default is [websocket.DefaultDialer].
-	Dialer *websocket.Dialer
 	// Logger is the logger. If not set, the pool uses [slog.Default].
 	Logger *slog.Logger
 }
@@ -104,9 +108,6 @@ func (c *Config) CheckAndSetDefaults() error {
 	}
 	if c.DialsPerMinute <= 0 {
 		c.DialsPerMinute = defaultDialsPerMinute
-	}
-	if c.Dialer == nil {
-		c.Dialer = websocket.DefaultDialer
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -157,7 +158,8 @@ func LoadKey(path string) (ed25519.PrivateKey, error) {
 	return ed, nil
 }
 
-// SignedMessage returns the bytes the challenge signature covers.
+// SignedMessage returns the bytes the challenge signature covers. host is
+// the URL's Host field, with the port if the URL has one.
 func SignedMessage(host string, proxyNonce, authNonce []byte) []byte {
 	var b bytes.Buffer
 	b.WriteString(ChallengeDomain)
@@ -187,7 +189,8 @@ func New(cfg Config) (*Pool, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Pool{
-		cfg:     cfg,
+		cfg: cfg,
+		// A burst of Size lets the first fill dial without waiting.
 		limiter: rate.NewLimiter(rate.Limit(float64(cfg.DialsPerMinute)/60), cfg.Size),
 		conns:   make(chan net.Conn),
 		ctx:     ctx,
@@ -228,7 +231,7 @@ func (p *Pool) Close() error {
 func (p *Pool) run() {
 	defer p.wg.Done()
 	log := p.cfg.Logger.With("url", p.cfg.URL.Redacted())
-	backoff := time.Duration(0)
+	var backoff time.Duration
 	for {
 		if !p.limiter.Allow() {
 			log.WarnContext(p.ctx, "auth callout: dial rate limit reached", "dials_per_minute", p.cfg.DialsPerMinute)
@@ -245,6 +248,7 @@ func (p *Pool) run() {
 			continue
 		}
 		backoff = min(max(2*backoff, minBackoff), maxBackoff)
+		// Jitter spreads the redials when the proxy drops every WebSocket.
 		wait := backoff/2 + mathrand.N(backoff/2)
 		log.DebugContext(p.ctx, "auth callout: stream failed", "error", err, "retry_in", wait)
 		select {
@@ -259,35 +263,33 @@ func (p *Pool) run() {
 // to Accept after the proxy's first data message. It returns nil once a
 // handed-over stream closes.
 func (p *Pool) serveOne(log *slog.Logger) error {
-	ws, resp, err := p.cfg.Dialer.DialContext(p.ctx, p.cfg.URL.String(), nil)
-	if resp != nil {
-		resp.Body.Close()
-	}
+	var local, remote net.Addr = &net.TCPAddr{}, &net.TCPAddr{}
+	clientTrace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+		local, remote = info.Conn.LocalAddr(), info.Conn.RemoteAddr()
+	}}
+	ws, _, err := websocket.Dial(httptrace.WithClientTrace(p.ctx, clientTrace), p.cfg.URL.String(), nil)
 	if err != nil {
 		return trace.Wrap(err, "dialing")
 	}
-	stop := context.AfterFunc(p.ctx, func() { ws.Close() })
-	defer stop()
+	defer ws.CloseNow()
 	ws.SetReadLimit(readLimit)
 	log.DebugContext(p.ctx, "auth callout: dialed")
 
 	if err := p.answerChallenge(ws); err != nil {
-		ws.Close()
 		return trace.Wrap(err, "challenge")
 	}
 	log.DebugContext(p.ctx, "auth callout: challenge signed")
 
-	typ, first, err := ws.ReadMessage()
+	// The stream has no deadline here. It idles until the proxy uses it.
+	typ, first, err := ws.Read(p.ctx)
 	if err != nil {
-		ws.Close()
 		return trace.Wrap(err, "waiting for first message")
 	}
-	if typ != websocket.BinaryMessage {
-		ws.Close()
+	if typ != websocket.MessageBinary {
 		return trace.BadParameter("first message is not binary")
 	}
 
-	conn := newConn(ws, first)
+	conn := newConn(p.ctx, ws, first, local, remote)
 	select {
 	case p.conns <- conn:
 	case <-p.ctx.Done():
@@ -306,12 +308,13 @@ func (p *Pool) serveOne(log *slog.Logger) error {
 // answerChallenge reads the proxy nonce and writes the auth nonce and the
 // signature.
 func (p *Pool) answerChallenge(ws *websocket.Conn) error {
-	ws.SetReadDeadline(time.Now().Add(challengeTimeout))
-	typ, proxyNonce, err := ws.ReadMessage()
+	ctx, cancel := context.WithTimeout(p.ctx, challengeTimeout)
+	defer cancel()
+	typ, proxyNonce, err := ws.Read(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if typ != websocket.BinaryMessage || len(proxyNonce) != NonceSize {
+	if typ != websocket.MessageBinary || len(proxyNonce) != NonceSize {
 		return trace.BadParameter("proxy nonce is not %d binary bytes", NonceSize)
 	}
 	authNonce := make([]byte, NonceSize)
@@ -319,11 +322,8 @@ func (p *Pool) answerChallenge(ws *websocket.Conn) error {
 		return trace.Wrap(err)
 	}
 	sig := ed25519.Sign(p.cfg.Key, SignedMessage(p.cfg.URL.Host, proxyNonce, authNonce))
-	ws.SetWriteDeadline(time.Now().Add(challengeTimeout))
-	if err := ws.WriteMessage(websocket.BinaryMessage, append(authNonce, sig...)); err != nil {
+	if err := ws.Write(ctx, websocket.MessageBinary, append(authNonce, sig...)); err != nil {
 		return trace.Wrap(err)
 	}
-	ws.SetReadDeadline(time.Time{})
-	ws.SetWriteDeadline(time.Time{})
 	return nil
 }
