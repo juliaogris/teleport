@@ -920,6 +920,9 @@ func applyAuthConfig(fc *FileConfig, cfg *servicecfg.Config) error {
 	}
 
 	if fc.Auth.CalloutTo != "" {
+		if cfg.Auth.PROXYProtocolMode != multiplexer.PROXYProtocolOff {
+			return trace.BadParameter("auth_service.callout_to requires proxy_protocol: off")
+		}
 		u, err := url.Parse(fc.Auth.CalloutTo)
 		if err != nil {
 			return trace.BadParameter("auth_service.callout_to: %v", err)

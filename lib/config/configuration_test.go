@@ -1030,39 +1030,54 @@ func TestApplyDefaultAuthResources(t *testing.T) {
 }
 
 func TestApplyAuthCallout(t *testing.T) {
+	const key = "\n  callout_key_file: /etc/teleport/callout.pem"
 	for _, tc := range []struct {
 		name    string
 		yaml    string
 		wantURL string
-		wantErr bool
+		wantErr string
 	}{
 		{
+			name:    "unset",
+			yaml:    "cluster_name: example",
+			wantURL: "",
+			wantErr: "",
+		},
+		{
 			name:    "wss",
-			yaml:    "callout_to: wss://teleport.example.com/tunnel/auth\n  callout_key_file: /etc/teleport/callout.pem",
+			yaml:    "proxy_protocol: off\n  callout_to: wss://teleport.example.com/tunnel/auth" + key,
 			wantURL: "wss://teleport.example.com/tunnel/auth",
-			wantErr: false,
+			wantErr: "",
 		},
 		{
 			name:    "ws to localhost",
-			yaml:    "callout_to: ws://localhost:8787/tunnel/auth\n  callout_key_file: /etc/teleport/callout.pem",
+			yaml:    "proxy_protocol: off\n  callout_to: ws://localhost:8787/tunnel/auth" + key,
 			wantURL: "ws://localhost:8787/tunnel/auth",
-			wantErr: false,
+			wantErr: "",
 		},
 		{
 			name:    "ws to public host",
-			yaml:    "callout_to: ws://teleport.example.com/tunnel/auth\n  callout_key_file: /etc/teleport/callout.pem",
-			wantErr: true,
+			yaml:    "proxy_protocol: off\n  callout_to: ws://teleport.example.com/tunnel/auth" + key,
+			wantURL: "",
+			wantErr: "not a private address",
 		},
 		{
 			name:    "no key file",
-			yaml:    "callout_to: wss://teleport.example.com/tunnel/auth",
-			wantErr: true,
+			yaml:    "proxy_protocol: off\n  callout_to: wss://teleport.example.com/tunnel/auth",
+			wantURL: "",
+			wantErr: "callout_key_file is required",
 		},
 		{
-			name:    "unset",
-			yaml:    "proxy_protocol: off",
+			name:    "proxy_protocol unset",
+			yaml:    "callout_to: wss://teleport.example.com/tunnel/auth" + key,
 			wantURL: "",
-			wantErr: false,
+			wantErr: "requires proxy_protocol: off",
+		},
+		{
+			name:    "proxy_protocol on",
+			yaml:    "proxy_protocol: on\n  callout_to: wss://teleport.example.com/tunnel/auth" + key,
+			wantURL: "",
+			wantErr: "requires proxy_protocol: off",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1070,8 +1085,8 @@ func TestApplyAuthCallout(t *testing.T) {
 			require.NoError(t, err)
 			cfg := servicecfg.MakeDefaultConfig()
 			err = ApplyFileConfig(conf, cfg)
-			if tc.wantErr {
-				require.Error(t, err)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
 				return
 			}
 			require.NoError(t, err)

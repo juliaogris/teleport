@@ -809,8 +809,10 @@ type Auth struct {
 	// with enabled PROXY protocol in front of Teleport you should set it to 'on', if you don't have it, set it to 'off'
 	ProxyProtocol string `yaml:"proxy_protocol,omitempty"`
 
-	// CalloutTo is the WebSocket URL of a proxy that auth connects out to,
-	// for a proxy that cannot dial auth.
+	// CalloutTo is the WebSocket URL of a proxy that cannot dial auth. Auth
+	// connects out to it. It must be a wss:// URL, or a ws:// URL whose host
+	// is localhost or a loopback or private IP address. It requires
+	// proxy_protocol: off.
 	CalloutTo string `yaml:"callout_to,omitempty"`
 
 	// CalloutKeyFile is the path of the Ed25519 private key, in PEM PKCS #8
