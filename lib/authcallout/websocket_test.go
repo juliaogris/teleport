@@ -47,16 +47,17 @@ func (c *countingConn) Read(b []byte) (int, error) {
 func TestReadLimitCountsInflatedBytes(t *testing.T) {
 	const limit = 64 << 10
 	compressed := &websocket.AcceptOptions{CompressionMode: websocket.CompressionContextTakeover}
+	ctx := t.Context()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := websocket.Accept(w, r, compressed)
 		if err != nil {
 			return
 		}
 		defer ws.CloseNow()
-		if err := ws.Write(context.Background(), websocket.MessageBinary, make([]byte, 4*limit)); err != nil {
+		if err := ws.Write(ctx, websocket.MessageBinary, make([]byte, 4*limit)); err != nil {
 			return
 		}
-		ws.Read(context.Background())
+		ws.Read(ctx)
 	}))
 	t.Cleanup(srv.Close)
 

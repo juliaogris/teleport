@@ -56,19 +56,7 @@ func newFakeHub(t *testing.T, pub ed25519.PublicKey) *fakeHub {
 		if err != nil {
 			return
 		}
-		nonce := make([]byte, NonceSize)
-		rand.Read(nonce)
-		if err := ws.Write(ctx, websocket.MessageBinary, nonce); err != nil {
-			ws.CloseNow()
-			return
-		}
-		_, reply, err := ws.Read(ctx)
-		if err != nil || len(reply) != NonceSize+ed25519.SignatureSize {
-			ws.CloseNow()
-			return
-		}
-		msg := SignedMessage(r.Host, nonce, reply[:NonceSize])
-		if !ed25519.Verify(h.pub, msg, reply[NonceSize:]) {
+		if !verifyChallenge(ctx, ws, h.pub, r.Host) {
 			ws.CloseNow()
 			return
 		}
@@ -76,6 +64,22 @@ func newFakeHub(t *testing.T, pub ed25519.PublicKey) *fakeHub {
 	}))
 	t.Cleanup(h.srv.Close)
 	return h
+}
+
+// verifyChallenge sends a nonce on ws and reports whether the reply is a
+// valid signature by pub over host and the nonces.
+func verifyChallenge(ctx context.Context, ws *websocket.Conn, pub ed25519.PublicKey, host string) bool {
+	nonce := make([]byte, NonceSize)
+	rand.Read(nonce)
+	if err := ws.Write(ctx, websocket.MessageBinary, nonce); err != nil {
+		return false
+	}
+	_, reply, err := ws.Read(ctx)
+	if err != nil || len(reply) != NonceSize+ed25519.SignatureSize {
+		return false
+	}
+	msg := SignedMessage(host, nonce, reply[:NonceSize])
+	return ed25519.Verify(pub, msg, reply[NonceSize:])
 }
 
 func (h *fakeHub) url(t *testing.T) *url.URL {

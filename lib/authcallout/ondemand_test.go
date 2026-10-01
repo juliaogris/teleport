@@ -67,15 +67,7 @@ func newLazyEdge(t *testing.T, pub ed25519.PublicKey) *lazyEdge {
 		}
 		switch r.URL.Query().Get("mode") {
 		case "control":
-			nonce := make([]byte, NonceSize)
-			rand.Read(nonce)
-			if err := ws.Write(ctx, websocket.MessageBinary, nonce); err != nil {
-				ws.CloseNow()
-				return
-			}
-			_, reply, err := ws.Read(ctx)
-			if err != nil || len(reply) != NonceSize+ed25519.SignatureSize ||
-				!ed25519.Verify(e.pub, SignedMessage(r.Host, nonce, reply[:NonceSize]), reply[NonceSize:]) {
+			if !verifyChallenge(ctx, ws, e.pub, r.Host) {
 				ws.CloseNow()
 				return
 			}
@@ -141,8 +133,7 @@ func newOnDemandPool(t *testing.T, u *url.URL, key ed25519.PrivateKey, opts ...f
 
 func newStreamID(t *testing.T) string {
 	b := make([]byte, streamIDSize)
-	_, err := rand.Read(b)
-	require.NoError(t, err)
+	rand.Read(b)
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
@@ -150,16 +141,12 @@ func sendDial(t *testing.T, ws *websocket.Conn, kind, id string) {
 	require.NoError(t, ws.Write(t.Context(), websocket.MessageText, []byte("dial "+kind+" "+id)))
 }
 
-// requireClosed reads from ws until it fails, within 5 s.
+// requireClosed reads ws until it fails, within 5 s.
 func requireClosed(t *testing.T, ws *websocket.Conn) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for {
-			if _, _, err := ws.Read(t.Context()); err != nil {
-				return
-			}
-		}
+		readUntilClosed(t, ws)
 	}()
 	select {
 	case <-done:
@@ -168,12 +155,48 @@ func requireClosed(t *testing.T, ws *websocket.Conn) {
 	}
 }
 
+// requireRefuse reads the next control message and requires it to refuse
+// id.
+func requireRefuse(t *testing.T, ctl *websocket.Conn, id string) {
+	typ, msg, err := ctl.Read(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, websocket.MessageText, typ)
+	require.Equal(t, "refuse "+id, string(msg))
+}
+
 func TestOnDemandControlChallenge(t *testing.T) {
 	pub, priv := newKey(t)
 	e := newLazyEdge(t, pub)
 	newOnDemandPool(t, e.url(t), priv)
 	e.control(t)
 	e.noStream(t, 200*time.Millisecond)
+}
+
+func TestOnDemandPing(t *testing.T) {
+	fast := func(c *Config) { c.pingEvery, c.pongTimeout = 50*time.Millisecond, 200*time.Millisecond }
+
+	t.Run("pong keeps the socket open", func(t *testing.T) {
+		pub, priv := newKey(t)
+		e := newLazyEdge(t, pub)
+		newOnDemandPool(t, e.url(t), priv, fast)
+		ctl := e.control(t)
+		for range 3 {
+			typ, msg, err := ctl.Read(t.Context())
+			require.NoError(t, err)
+			require.Equal(t, websocket.MessageText, typ)
+			require.Equal(t, "ping", string(msg))
+			require.NoError(t, ctl.Write(t.Context(), websocket.MessageText, []byte("pong")))
+		}
+	})
+
+	t.Run("missing pong closes the socket", func(t *testing.T) {
+		pub, priv := newKey(t)
+		e := newLazyEdge(t, pub)
+		newOnDemandPool(t, e.url(t), priv, fast)
+		ctl := e.control(t)
+		requireClosed(t, ctl)
+		e.control(t)
+	})
 }
 
 func TestOnDemandDialAuthReachesAccept(t *testing.T) {
@@ -186,6 +209,8 @@ func TestOnDemandDialAuthReachesAccept(t *testing.T) {
 	sendDial(t, ctl, "auth", id)
 	s := e.stream(t)
 	require.Equal(t, id, s.id)
+	require.Equal(t, url.Values{"mode": {"stream"}}, s.query)
+	require.Equal(t, StreamAcks, s.header.Get(StreamHeader))
 
 	c, err := p.Accept()
 	require.NoError(t, err)
@@ -245,13 +270,6 @@ func TestOnDemandDialAppNoHandler(t *testing.T) {
 }
 
 func TestOnDemandRefusesDroppedDial(t *testing.T) {
-	requireRefuse := func(t *testing.T, ctl *websocket.Conn, id string) {
-		typ, msg, err := ctl.Read(t.Context())
-		require.NoError(t, err)
-		require.Equal(t, websocket.MessageText, typ)
-		require.Equal(t, "refuse "+id, string(msg))
-	}
-
 	t.Run("no app handler", func(t *testing.T) {
 		pub, priv := newKey(t)
 		e := newLazyEdge(t, pub)
@@ -294,27 +312,13 @@ func TestOnDemandRefusesDroppedDial(t *testing.T) {
 	})
 }
 
-func TestOnDemandStreamIDHeader(t *testing.T) {
-	pub, priv := newKey(t)
-	e := newLazyEdge(t, pub)
-	newOnDemandPool(t, e.url(t), priv)
-	ctl := e.control(t)
-
-	id := newStreamID(t)
-	sendDial(t, ctl, "auth", id)
-	s := e.stream(t)
-	require.Equal(t, id, s.id)
-	require.Equal(t, url.Values{"mode": {"stream"}}, s.query)
-	require.Equal(t, StreamAcks, s.header.Get(StreamHeader))
-}
-
 func TestOnDemandBadMessageClosesControl(t *testing.T) {
 	for _, msg := range []string{
+		"hello",
+		"dial auth",
+		"dial ssh " + strings.Repeat("A", 43),
 		"dial auth short",
 		"dial auth " + strings.Repeat("A", 43) + "=",
-		"dial ssh " + strings.Repeat("A", 43),
-		"dial auth",
-		"hello",
 	} {
 		t.Run(msg, func(t *testing.T) {
 			pub, priv := newKey(t)
@@ -329,33 +333,6 @@ func TestOnDemandBadMessageClosesControl(t *testing.T) {
 			e.control(t)
 		})
 	}
-}
-
-func TestOnDemandPing(t *testing.T) {
-	fast := func(c *Config) { c.pingEvery, c.pongTimeout = 50*time.Millisecond, 200*time.Millisecond }
-
-	t.Run("pong keeps the socket open", func(t *testing.T) {
-		pub, priv := newKey(t)
-		e := newLazyEdge(t, pub)
-		newOnDemandPool(t, e.url(t), priv, fast)
-		ctl := e.control(t)
-		for range 3 {
-			typ, msg, err := ctl.Read(t.Context())
-			require.NoError(t, err)
-			require.Equal(t, websocket.MessageText, typ)
-			require.Equal(t, "ping", string(msg))
-			require.NoError(t, ctl.Write(t.Context(), websocket.MessageText, []byte("pong")))
-		}
-	})
-
-	t.Run("missing pong closes the socket", func(t *testing.T) {
-		pub, priv := newKey(t)
-		e := newLazyEdge(t, pub)
-		newOnDemandPool(t, e.url(t), priv, fast)
-		ctl := e.control(t)
-		requireClosed(t, ctl)
-		e.control(t)
-	})
 }
 
 func TestOnDemandRedialsAfterClose(t *testing.T) {
