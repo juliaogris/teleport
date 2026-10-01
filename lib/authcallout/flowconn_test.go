@@ -17,7 +17,6 @@
 package authcallout
 
 import (
-	"context"
 	"io"
 	"net"
 	"strconv"
@@ -28,9 +27,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// dialAppStream opens an on-demand app stream and returns the edge's end
-// and the callout's flowConn.
-func dialAppStream(t *testing.T) (*websocket.Conn, net.Conn) {
+// appStream is an open on-demand app stream: the pool, the edge's end and
+// the callout's flowConn.
+type appStream struct {
+	pool *Pool
+	edge *websocket.Conn
+	conn net.Conn
+}
+
+// dialAppStream opens an on-demand app stream.
+func dialAppStream(t *testing.T) appStream {
 	pub, priv := newKey(t)
 	e := newLazyEdge(t, pub)
 	p := newOnDemandPool(t, e.url(t), priv)
@@ -44,10 +50,10 @@ func dialAppStream(t *testing.T) (*websocket.Conn, net.Conn) {
 	select {
 	case c := <-got:
 		t.Cleanup(func() { c.Close() })
-		return s.ws, c
+		return appStream{pool: p, edge: s.ws, conn: c}
 	case <-time.After(5 * time.Second):
 		t.Fatal("app handler not called within 5s")
-		return nil, nil
+		return appStream{}
 	}
 }
 
@@ -61,15 +67,59 @@ func readBytes(t *testing.T, ws *websocket.Conn, n int) {
 	}
 }
 
+// readUntilClosed reads ws until it fails and returns the error.
+func readUntilClosed(t *testing.T, ws *websocket.Conn) error {
+	for {
+		if _, _, err := ws.Read(t.Context()); err != nil {
+			return err
+		}
+	}
+}
+
+// drain reads and drops what the callout sends, without acking, so a
+// writer blocks on the window and not on TCP.
+func drain(t *testing.T, ws *websocket.Conn) {
+	go readUntilClosed(t, ws)
+}
+
+func TestFlowConnReadsBinaryAndSkipsAcks(t *testing.T) {
+	s := dialAppStream(t)
+	require.NoError(t, s.edge.Write(t.Context(), websocket.MessageBinary, []byte("hel")))
+	require.NoError(t, s.edge.Write(t.Context(), websocket.MessageText, []byte("ack 0")))
+	require.NoError(t, s.edge.Write(t.Context(), websocket.MessageBinary, []byte("lo")))
+	buf := make([]byte, 5)
+	_, err := io.ReadFull(s.conn, buf)
+	require.NoError(t, err)
+	require.Equal(t, "hello", string(buf))
+}
+
+func TestFlowConnAcksWhatReadHandsOn(t *testing.T) {
+	s := dialAppStream(t)
+	chunk := make([]byte, 64<<10)
+	for range 5 {
+		require.NoError(t, s.edge.Write(t.Context(), websocket.MessageBinary, chunk))
+	}
+	// Each Read takes at most one chunk, so the total crosses ackEvery
+	// exactly at the fourth.
+	for range 5 {
+		_, err := io.ReadFull(s.conn, chunk)
+		require.NoError(t, err)
+	}
+	typ, msg, err := s.edge.Read(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, websocket.MessageText, typ)
+	require.Equal(t, "ack "+strconv.Itoa(ackEvery), string(msg))
+}
+
 func TestFlowConnWritesStopAtTheWindow(t *testing.T) {
-	edge, c := dialAppStream(t)
+	s := dialAppStream(t)
 	wrote := make(chan int, 1)
 	go func() {
-		n, _ := c.Write(make([]byte, 3*streamWindow))
+		n, _ := s.conn.Write(make([]byte, 3*streamWindow))
 		wrote <- n
 	}()
 
-	readBytes(t, edge, streamWindow)
+	readBytes(t, s.edge, streamWindow)
 	select {
 	case n := <-wrote:
 		t.Fatalf("Write returned %d bytes without an ack", n)
@@ -77,10 +127,10 @@ func TestFlowConnWritesStopAtTheWindow(t *testing.T) {
 	}
 
 	// The edge acks only what it has read, as the hub does.
-	require.NoError(t, edge.Write(t.Context(), websocket.MessageText, []byte("ack "+strconv.Itoa(streamWindow))))
-	readBytes(t, edge, streamWindow)
-	require.NoError(t, edge.Write(t.Context(), websocket.MessageText, []byte("ack "+strconv.Itoa(2*streamWindow))))
-	readBytes(t, edge, streamWindow)
+	require.NoError(t, s.edge.Write(t.Context(), websocket.MessageText, []byte("ack "+strconv.Itoa(streamWindow))))
+	readBytes(t, s.edge, streamWindow)
+	require.NoError(t, s.edge.Write(t.Context(), websocket.MessageText, []byte("ack "+strconv.Itoa(2*streamWindow))))
+	readBytes(t, s.edge, streamWindow)
 	select {
 	case n := <-wrote:
 		require.Equal(t, 3*streamWindow, n)
@@ -89,129 +139,100 @@ func TestFlowConnWritesStopAtTheWindow(t *testing.T) {
 	}
 }
 
-func TestFlowConnReadsBinaryAndSkipsAcks(t *testing.T) {
-	edge, c := dialAppStream(t)
-	require.NoError(t, edge.Write(t.Context(), websocket.MessageBinary, []byte("hel")))
-	require.NoError(t, edge.Write(t.Context(), websocket.MessageText, []byte("ack 0")))
-	require.NoError(t, edge.Write(t.Context(), websocket.MessageBinary, []byte("lo")))
-	buf := make([]byte, 5)
-	got := 0
-	for got < 5 {
-		n, err := c.Read(buf[got:])
-		require.NoError(t, err)
-		got += n
-	}
-	require.Equal(t, "hello", string(buf))
-}
-
-func TestFlowConnAcksWhatReadHandsOn(t *testing.T) {
-	edge, c := dialAppStream(t)
-	chunk := make([]byte, 64<<10)
-	for range 5 {
-		require.NoError(t, edge.Write(t.Context(), websocket.MessageBinary, chunk))
-	}
-	// Each Read takes at most one chunk, so the total crosses ackEvery
-	// exactly at the fourth.
-	for range 5 {
-		_, err := io.ReadFull(c, chunk)
-		require.NoError(t, err)
-	}
-	typ, msg, err := edge.Read(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, websocket.MessageText, typ)
-	require.Equal(t, "ack "+strconv.Itoa(ackEvery), string(msg))
-}
-
 func TestFlowConnReadsEOFWhenProxyCloses(t *testing.T) {
 	for _, status := range []websocket.StatusCode{websocket.StatusNormalClosure, websocket.StatusGoingAway} {
 		t.Run(status.String(), func(t *testing.T) {
-			edge, c := dialAppStream(t)
-			require.NoError(t, edge.Close(status, ""))
-			_, err := c.Read(make([]byte, 1))
+			s := dialAppStream(t)
+			require.NoError(t, s.edge.Close(status, ""))
+			_, err := s.conn.Read(make([]byte, 1))
 			require.ErrorIs(t, err, io.EOF)
 		})
 	}
 }
 
-func TestFlowConnBadAckCloses(t *testing.T) {
-	for _, ack := range []string{"ack 99", "ack -1", "ack x", "hello"} {
-		t.Run(ack, func(t *testing.T) {
-			edge, c := dialAppStream(t)
-			require.NoError(t, edge.Write(t.Context(), websocket.MessageText, []byte(ack)))
-			_, err := c.Read(make([]byte, 1))
-			require.Error(t, err)
-		})
-	}
+func TestFlowConnCloseSendsCloseFrame(t *testing.T) {
+	s := dialAppStream(t)
+	require.NoError(t, s.conn.Close())
+	err := readUntilClosed(t, s.edge)
+	require.Equal(t, websocket.StatusNormalClosure, websocket.CloseStatus(err))
 }
 
-func TestFlowConnReadDeadline(t *testing.T) {
-	_, c := dialAppStream(t)
-	require.NoError(t, c.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
-	_, err := c.Read(make([]byte, 1))
-	var ne net.Error
-	require.ErrorAs(t, err, &ne)
-	require.True(t, ne.Timeout())
-	// A write is not held by the read deadline.
-	_, err = c.Write([]byte("x"))
-	require.NoError(t, err)
-}
-
-// drain reads and drops what the callout sends, without acking, so a
-// writer blocks on the window and not on TCP.
-func drain(ws *websocket.Conn) {
-	go func() {
-		for {
-			if _, _, err := ws.Read(context.Background()); err != nil {
-				return
-			}
-		}
-	}()
-}
-
-func TestFlowConnWriteDeadlineWhileWindowFull(t *testing.T) {
-	edge, c := dialAppStream(t)
-	drain(edge)
-	_, err := c.Write(make([]byte, streamWindow))
-	require.NoError(t, err)
-	require.NoError(t, c.SetWriteDeadline(time.Now().Add(100*time.Millisecond)))
-	_, err = c.Write([]byte("x"))
-	var ne net.Error
-	require.ErrorAs(t, err, &ne)
-	require.True(t, ne.Timeout())
+func TestFlowConnPoolCloseSendsCloseFrame(t *testing.T) {
+	s := dialAppStream(t)
+	require.NoError(t, s.pool.Close())
+	err := readUntilClosed(t, s.edge)
+	require.Equal(t, websocket.StatusNormalClosure, websocket.CloseStatus(err))
 }
 
 func TestFlowConnCloseUnblocksWrite(t *testing.T) {
-	edge, c := dialAppStream(t)
-	drain(edge)
+	s := dialAppStream(t)
 	done := make(chan error, 1)
 	go func() {
-		_, err := c.Write(make([]byte, 2*streamWindow))
+		_, err := s.conn.Write(make([]byte, 2*streamWindow))
 		done <- err
 	}()
-	time.Sleep(200 * time.Millisecond)
-	require.NoError(t, c.Close())
+	// The edge never acks, so the writer is parked on the window once the
+	// edge has the first window.
+	readBytes(t, s.edge, streamWindow)
+	require.NoError(t, s.conn.Close())
 	select {
 	case err := <-done:
 		require.ErrorIs(t, err, net.ErrClosed)
 	case <-time.After(10 * time.Second):
 		t.Fatal("Write still blocked after Close")
 	}
+	err := readUntilClosed(t, s.edge)
+	require.Equal(t, websocket.StatusNormalClosure, websocket.CloseStatus(err))
+}
+
+func TestFlowConnBadAckCloses(t *testing.T) {
+	for _, ack := range []string{"ack 99", "ack -1", "ack x", "hello"} {
+		t.Run(ack, func(t *testing.T) {
+			s := dialAppStream(t)
+			require.NoError(t, s.edge.Write(t.Context(), websocket.MessageText, []byte(ack)))
+			_, err := s.conn.Read(make([]byte, 1))
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestFlowConnReadDeadline(t *testing.T) {
+	s := dialAppStream(t)
+	require.NoError(t, s.conn.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
+	_, err := s.conn.Read(make([]byte, 1))
+	var ne net.Error
+	require.ErrorAs(t, err, &ne)
+	require.True(t, ne.Timeout())
+	// A write is not held by the read deadline.
+	_, err = s.conn.Write([]byte("x"))
+	require.NoError(t, err)
+}
+
+func TestFlowConnWriteDeadlineWhileWindowFull(t *testing.T) {
+	s := dialAppStream(t)
+	drain(t, s.edge)
+	_, err := s.conn.Write(make([]byte, streamWindow))
+	require.NoError(t, err)
+	require.NoError(t, s.conn.SetWriteDeadline(time.Now().Add(100*time.Millisecond)))
+	_, err = s.conn.Write([]byte("x"))
+	var ne net.Error
+	require.ErrorAs(t, err, &ne)
+	require.True(t, ne.Timeout())
 }
 
 func TestFlowConnTooMuchUnreadCloses(t *testing.T) {
-	edge, c := dialAppStream(t)
+	s := dialAppStream(t)
 	// The hub sends at most 64 KiB per message.
 	chunk := make([]byte, 64<<10)
 	for range maxPendingRead/len(chunk) + 1 {
-		if err := edge.Write(t.Context(), websocket.MessageBinary, chunk); err != nil {
+		if err := s.edge.Write(t.Context(), websocket.MessageBinary, chunk); err != nil {
 			break
 		}
 	}
 	// Nobody reads, so the bytes pile up past the limit.
-	fc := c.(*flowConn)
-	require.Eventually(t, func() bool {
-		fc.mu.Lock()
-		defer fc.mu.Unlock()
-		return fc.closed
-	}, 10*time.Second, 50*time.Millisecond, "the stream stayed open with more than maxPendingRead unread")
+	select {
+	case <-s.conn.(*flowConn).done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stream stayed open with more than maxPendingRead unread")
+	}
 }

@@ -211,9 +211,16 @@ func (p *Pool) serveControl(log *slog.Logger) error {
 		pingErr <- p.ping(ctx, ws, &lastPong)
 		cancel()
 	}()
+	// The read below is not bound to ctx. A read that ends with its
+	// context drops the connection with no close frame, so a stop ends it
+	// through the close handshake instead.
+	go func() {
+		<-ctx.Done()
+		closeGracefully(ws, websocket.StatusGoingAway)
+	}()
 
 	for {
-		typ, msg, err := ws.Read(ctx)
+		typ, msg, err := ws.Read(context.Background())
 		if err != nil {
 			select {
 			case errPing := <-pingErr:

@@ -367,6 +367,16 @@ func TestOnDemandRedialsAfterClose(t *testing.T) {
 	e.control(t)
 }
 
+func TestOnDemandStopClosesControlGoingAway(t *testing.T) {
+	pub, priv := newKey(t)
+	e := newLazyEdge(t, pub)
+	p := newOnDemandPool(t, e.url(t), priv)
+	ctl := e.control(t)
+	p.Stop()
+	err := readUntilClosed(t, ctl)
+	require.Equal(t, websocket.StatusGoingAway, websocket.CloseStatus(err))
+}
+
 func TestNextControlBackoff(t *testing.T) {
 	const minBackoff, maxControlBackoff = 100 * time.Millisecond, 10 * time.Minute
 	p := &Pool{cfg: Config{minBackoff: minBackoff, maxControlBackoff: maxControlBackoff}}

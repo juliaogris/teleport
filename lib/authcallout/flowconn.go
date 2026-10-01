@@ -138,9 +138,13 @@ func (c *flowConn) closeWhenIdle() {
 
 // readLoop reads messages until the WebSocket fails: binary messages are
 // queued for Read, and text acks open the write window.
+//
+// The read is not bound to the conn's context. A read that ends with the
+// context drops the connection with no close frame, so Close ends it
+// through the close handshake instead.
 func (c *flowConn) readLoop() {
 	for {
-		typ, msg, err := c.ws.Read(c.ctx)
+		typ, msg, err := c.ws.Read(context.Background())
 		if err != nil {
 			c.fail(readError(err))
 			return
@@ -347,29 +351,34 @@ func (c *flowConn) wait(deadline time.Time) {
 	t.Stop()
 }
 
-// Close closes the WebSocket. It interrupts a blocked Read or Write.
+// Close closes the WebSocket with a close handshake. It interrupts a
+// blocked Read or Write.
 func (c *flowConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closed = true
 		c.cond.Broadcast()
 		c.mu.Unlock()
-		// Close before cancelling: cancelling ctx makes the WebSocket
-		// drop the connection with no close frame, which the edge would
-		// see as a network drop.
-		closed := make(chan struct{})
-		go func() {
-			c.ws.Close(websocket.StatusNormalClosure, "")
-			close(closed)
-		}()
-		select {
-		case <-closed:
-		case <-time.After(closeTimeout):
-		}
+		closeGracefully(c.ws, websocket.StatusNormalClosure)
 		c.cancel()
 		close(c.done)
 	})
 	return nil
+}
+
+// closeGracefully performs the close handshake with code, and drops the
+// connection if the handshake takes longer than [closeTimeout].
+func closeGracefully(ws *websocket.Conn, code websocket.StatusCode) {
+	closed := make(chan struct{})
+	go func() {
+		ws.Close(code, "")
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(closeTimeout):
+		ws.CloseNow()
+	}
 }
 
 // LocalAddr returns the local address of the WebSocket's TCP connection.
