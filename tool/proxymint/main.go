@@ -21,22 +21,29 @@
 //
 // Usage:
 //
-//	proxymint -auth 127.0.0.1:3025 -token <proxy-token> \
-//	  -host-uuid <uuid> -principal teleport.example.com -out ./identity
+//	proxymint -auth 127.0.0.1:3025 -token-file ./proxy.token \
+//	  -ca-pin sha256:<pin> -host-uuid <uuid> \
+//	  -principal teleport.example.com -out ./identity
 //
-// The directory receives key.pem (PKCS#8), key (OpenSSH), ssh-cert.pub,
-// tls.crt, tls-ca.crt and ssh-ca.pub. The token must allow the proxy role.
+// The token file holds the join token, which must allow the proxy role.
+// Auth is verified with -ca-pin or -ca-path. -insecure joins without
+// verifying auth, for a loopback auth only.
+//
+// The directory receives key.pem (PKCS #8), key (OpenSSH), ssh-cert.pub,
+// tls.crt, tls-ca.crt and ssh-ca.pub.
 package main
 
 import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -47,27 +54,80 @@ import (
 	"github.com/gravitational/teleport/lib/utils"
 )
 
+// flags are the command line flags.
+type flags struct {
+	authAddr  string
+	tokenFile string
+	hostUUID  string
+	principal string
+	caPath    string
+	caPins    string
+	insecure  bool
+	out       string
+}
+
 func main() {
-	authAddr := flag.String("auth", "127.0.0.1:3025", "auth server address")
-	token := flag.String("token", "", "join token that allows the proxy role")
-	hostUUID := flag.String("host-uuid", "", "host UUID for the proxy identity")
-	principal := flag.String("principal", "", "public hostname of the proxy")
-	caPath := flag.String("ca-path", "", "path to the cluster CA file; empty skips CA verification")
-	out := flag.String("out", "identity", "output directory")
+	var f flags
+	flag.StringVar(&f.authAddr, "auth", "127.0.0.1:3025", "auth server address")
+	flag.StringVar(&f.tokenFile, "token-file", "", "file holding a join token that allows the proxy role")
+	flag.StringVar(&f.hostUUID, "host-uuid", "", "host UUID for the proxy identity")
+	flag.StringVar(&f.principal, "principal", "", "public hostname of the proxy")
+	flag.StringVar(&f.caPath, "ca-path", "", "path to the cluster CA file that verifies auth")
+	flag.StringVar(&f.caPins, "ca-pin", "", "comma-separated CA pins that verify auth; takes precedence over -ca-path")
+	flag.BoolVar(&f.insecure, "insecure", false, "join without verifying auth")
+	flag.StringVar(&f.out, "out", "identity", "output directory")
 	flag.Parse()
-	if *token == "" || *hostUUID == "" || *principal == "" {
+	if f.tokenFile == "" || f.hostUUID == "" || f.principal == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if err := run(*authAddr, *token, *hostUUID, *principal, *caPath, *out); err != nil {
+	if err := f.checkVerification(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		flag.Usage()
+		os.Exit(2)
+	}
+	if err := run(f); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(authAddr, token, hostUUID, principal, caPath, out string) error {
-	addr, err := utils.ParseAddr(authAddr)
+// checkVerification returns an error unless the flags name a way to verify
+// auth, or say not to.
+//
+// A -ca-path that does not exist is an error here, because the join
+// library joins without verification when the file is missing.
+func (f flags) checkVerification() error {
+	switch {
+	case f.insecure:
+		return nil
+	case f.caPins != "":
+		return nil
+	case f.caPath != "":
+		_, err := os.Stat(f.caPath)
+		if err != nil {
+			return fmt.Errorf("-ca-path: %w", err)
+		}
+		return nil
+	}
+	return errors.New("one of -ca-pin, -ca-path or -insecure is required")
+}
+
+func run(f flags) error {
+	addr, err := utils.ParseAddr(f.authAddr)
 	if err != nil {
 		return err
+	}
+	tokenBytes, err := os.ReadFile(f.tokenFile)
+	if err != nil {
+		return fmt.Errorf("reading token: %w", err)
+	}
+	token := strings.TrimSpace(string(tokenBytes))
+	if token == "" {
+		return fmt.Errorf("token file %s is empty", f.tokenFile)
+	}
+	var caPins []string
+	if f.caPins != "" {
+		caPins = strings.Split(f.caPins, ",")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -76,13 +136,15 @@ func run(authAddr, token, hostUUID, principal, caPath, out string) error {
 		Token: token,
 		ID: state.IdentityID{
 			Role:     types.RoleProxy,
-			HostUUID: hostUUID,
-			NodeName: principal,
+			HostUUID: f.hostUUID,
+			NodeName: f.principal,
 		},
 		AuthServers:          []utils.NetAddr{*addr},
-		AdditionalPrincipals: []string{principal},
-		DNSNames:             []string{principal},
-		CAPath:               caPath,
+		AdditionalPrincipals: []string{f.principal},
+		DNSNames:             []string{f.principal},
+		CAPins:               caPins,
+		CAPath:               f.caPath,
+		Insecure:             f.insecure,
 	})
 	if err != nil {
 		return fmt.Errorf("registering: %w", err)
@@ -105,7 +167,7 @@ func run(authAddr, token, hostUUID, principal, caPath, out string) error {
 		sshCA = append(sshCA, c...)
 	}
 
-	if err := os.MkdirAll(out, 0o700); err != nil {
+	if err := os.MkdirAll(f.out, 0o700); err != nil {
 		return err
 	}
 	files := map[string][]byte{
@@ -117,10 +179,10 @@ func run(authAddr, token, hostUUID, principal, caPath, out string) error {
 		"ssh-ca.pub":   sshCA,
 	}
 	for name, data := range files {
-		if err := os.WriteFile(filepath.Join(out, name), data, 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(f.out, name), data, 0o600); err != nil {
 			return err
 		}
 	}
-	fmt.Printf("wrote proxy identity for %s (%s) to %s\n", principal, hostUUID, out)
+	fmt.Printf("wrote proxy identity for %s (%s) to %s\n", f.principal, f.hostUUID, f.out)
 	return nil
 }
