@@ -104,6 +104,24 @@ func TestFlowConnReadsBinaryAndSkipsAcks(t *testing.T) {
 	require.Equal(t, "hello", string(buf))
 }
 
+func TestFlowConnAcksWhatReadHandsOn(t *testing.T) {
+	edge, c := dialAppStream(t)
+	chunk := make([]byte, 64<<10)
+	for range 5 {
+		require.NoError(t, edge.Write(t.Context(), websocket.MessageBinary, chunk))
+	}
+	// Each Read takes at most one chunk, so the total crosses ackEvery
+	// exactly at the fourth.
+	for range 5 {
+		_, err := io.ReadFull(c, chunk)
+		require.NoError(t, err)
+	}
+	typ, msg, err := edge.Read(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, websocket.MessageText, typ)
+	require.Equal(t, "ack "+strconv.Itoa(ackEvery), string(msg))
+}
+
 func TestFlowConnReadsEOFWhenProxyCloses(t *testing.T) {
 	for _, status := range []websocket.StatusCode{websocket.StatusNormalClosure, websocket.StatusGoingAway} {
 		t.Run(status.String(), func(t *testing.T) {

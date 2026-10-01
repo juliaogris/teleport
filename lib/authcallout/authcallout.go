@@ -54,6 +54,12 @@
 //     the proxy accepts only an id it sent on the control socket, once.
 //     An auth stream goes to [Pool.Accept]. An app stream goes to the
 //     handler set with [Pool.SetAppHandler].
+//  5. Binary messages on a stream carry its bytes. Each end sends the text
+//     "ack <n>" after every 256 KiB it has passed on, where <n> is the
+//     total so far, and keeps at most 1 MiB unacknowledged. The stream
+//     request carries the header "Sallyport-Stream: ack" to say that the
+//     pool acknowledges. A proxy that does not read the header applies no
+//     window to what it sends.
 //
 // An app stream is TLS from the proxy to the app service, as a reverse
 // tunnel connection would be. The pool authenticates the proxy only by the

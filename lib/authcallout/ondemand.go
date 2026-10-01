@@ -47,6 +47,12 @@ const (
 	// StreamIDHeader carries the stream id on a stream request in
 	// on-demand mode.
 	StreamIDHeader = "Sallyport-Stream-Id"
+	// StreamHeader on a stream request carries the stream features the
+	// pool supports. Its one value is [StreamAcks].
+	StreamHeader = "Sallyport-Stream"
+	// StreamAcks says the pool acknowledges the bytes it receives on the
+	// stream, so the proxy can apply a window to them.
+	StreamAcks = "ack"
 	// controlReadLimit is larger than any control message.
 	controlReadLimit = 256
 	// streamIDSize is the size of a stream id before base64url encoding.
@@ -288,7 +294,8 @@ func (p *Pool) dialStream(log *slog.Logger, kind streamKind, id string) {
 // serveStream opens one stream and hands it to auth's listener or to the
 // app handler. It returns once the stream closes.
 func (p *Pool) serveStream(kind streamKind, id string, handler func(net.Conn)) error {
-	ws, local, remote, err := p.dialWithAddrs(p.modeURL("stream"), http.Header{StreamIDHeader: []string{id}})
+	header := http.Header{StreamIDHeader: {id}, StreamHeader: {StreamAcks}}
+	ws, local, remote, err := p.dialWithAddrs(p.modeURL("stream"), header)
 	if err != nil {
 		return trace.Wrap(err, "dialing stream")
 	}

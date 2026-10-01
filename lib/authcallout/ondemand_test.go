@@ -35,9 +35,10 @@ import (
 
 // lazyStream is a stream socket the fake edge accepted.
 type lazyStream struct {
-	id    string
-	query url.Values
-	ws    *websocket.Conn
+	id     string
+	query  url.Values
+	header http.Header
+	ws     *websocket.Conn
 }
 
 // lazyEdge is the edge side of on-demand mode. Control sockets must pass
@@ -73,7 +74,7 @@ func newLazyEdge(t *testing.T, pub ed25519.PublicKey) *lazyEdge {
 			}
 			e.controls <- ws
 		case "stream":
-			e.streams <- lazyStream{id: r.Header.Get(StreamIDHeader), query: r.URL.Query(), ws: ws}
+			e.streams <- lazyStream{id: r.Header.Get(StreamIDHeader), query: r.URL.Query(), header: r.Header.Clone(), ws: ws}
 		default:
 			ws.CloseNow()
 		}
@@ -242,6 +243,7 @@ func TestOnDemandStreamIDHeader(t *testing.T) {
 	s := e.stream(t)
 	require.Equal(t, id, s.id)
 	require.Equal(t, url.Values{"mode": {"stream"}}, s.query)
+	require.Equal(t, StreamAcks, s.header.Get(StreamHeader))
 }
 
 func TestOnDemandBadMessageClosesControl(t *testing.T) {

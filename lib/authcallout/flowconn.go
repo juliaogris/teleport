@@ -30,15 +30,20 @@ import (
 )
 
 const (
-	// streamWindow is the most stream bytes the pool sends to the proxy
-	// before the proxy acknowledges them. The proxy acknowledges every
-	// 256 KiB, so a window of 1 MiB keeps data flowing while an ack is on
-	// its way.
+	// streamWindow is the most stream bytes either end sends before the
+	// other acknowledges them. Each end acknowledges every ackEvery, so a
+	// window of 1 MiB keeps data flowing while an ack is on its way. The
+	// proxy closes a stream that queues more than 1 MiB, so the window
+	// must not grow past that.
 	streamWindow = 1 << 20
+	// ackEvery is how many received bytes Read hands on between acks.
+	ackEvery = 256 << 10
 	// streamMessage is the largest message the pool writes on a stream.
 	streamMessage = 64 << 10
 	// maxPendingRead bounds the bytes from the proxy that wait for a
-	// reader. The proxy sends little on a stream: TLS records of requests.
+	// reader. A proxy that applies the window sends at most streamWindow
+	// before an ack. Only a proxy without the window reaches this limit,
+	// and an upload to an app that reads slower than the link then fails.
 	maxPendingRead = 8 << 20
 	// streamIdle closes a stream that has carried no bytes either way for
 	// this long, so that a proxy that stops acking or never closes cannot
@@ -50,20 +55,26 @@ const (
 )
 
 // flowConn is a [net.Conn] over one on-demand stream. Binary messages carry
-// stream bytes in both directions. The proxy sends text "ack <n>", where n
-// is the total number of stream bytes it has passed on, and Write keeps at
-// most [streamWindow] bytes unacknowledged. A reader goroutine reads the
+// stream bytes in both directions. Each end sends text "ack <n>", where n
+// is the total number of stream bytes it has passed on, and keeps at most
+// [streamWindow] bytes unacknowledged. A reader goroutine reads the
 // WebSocket at all times, so acks arrive even while nobody calls Read.
 type flowConn struct {
 	ws            *websocket.Conn
 	local, remote net.Addr
 
-	mu            sync.Mutex
-	cond          *sync.Cond
-	pending       []byte
-	readErr       error
-	sent          int64
-	acked         int64
+	mu      sync.Mutex
+	cond    *sync.Cond
+	pending []byte
+	readErr error
+	// sent and acked count the bytes written to the proxy and the bytes
+	// the proxy acknowledged.
+	sent  int64
+	acked int64
+	// received and ackSent count the bytes Read handed on and the bytes
+	// acknowledged to the proxy.
+	received      int64
+	ackSent       int64
 	closed        bool
 	readDeadline  time.Time
 	writeDeadline time.Time
@@ -71,7 +82,9 @@ type flowConn struct {
 	// active is when bytes last crossed in either direction.
 	active time.Time
 
-	writeMu   sync.Mutex
+	writeMu sync.Mutex
+	// ackMu orders the acks to the proxy, which must not go backwards.
+	ackMu     sync.Mutex
 	closeOnce sync.Once
 	done      chan struct{}
 	ctx       context.Context
@@ -193,8 +206,19 @@ func parseAck(text string) (int64, bool) {
 	return n, err == nil && n >= 0
 }
 
-// Read reads stream bytes from the proxy.
+// Read reads stream bytes from the proxy and acknowledges them after every
+// [ackEvery].
 func (c *flowConn) Read(b []byte) (int, error) {
+	n, err := c.take(b)
+	if err != nil {
+		return 0, err
+	}
+	c.ack()
+	return n, nil
+}
+
+// take moves pending bytes into b, waiting for some if none are pending.
+func (c *flowConn) take(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for len(c.pending) == 0 {
@@ -214,7 +238,27 @@ func (c *flowConn) Read(b []byte) (int, error) {
 	if len(c.pending) == 0 {
 		c.pending = nil
 	}
+	c.received += int64(n)
 	return n, nil
+}
+
+// ack sends the proxy the total of bytes handed on, once ackEvery more
+// have been since the last ack.
+//
+// A failed write is not reported: it also fails readLoop's Read, which
+// closes the conn.
+func (c *flowConn) ack() {
+	c.ackMu.Lock()
+	defer c.ackMu.Unlock()
+	c.mu.Lock()
+	if c.received-c.ackSent < ackEvery {
+		c.mu.Unlock()
+		return
+	}
+	c.ackSent = c.received
+	total := c.received
+	c.mu.Unlock()
+	c.ws.Write(c.ctx, websocket.MessageText, []byte("ack "+strconv.FormatInt(total, 10)))
 }
 
 // Write writes b as one or more messages, waiting while the window is
