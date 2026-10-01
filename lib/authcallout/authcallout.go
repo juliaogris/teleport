@@ -55,6 +55,7 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -94,6 +95,8 @@ type Config struct {
 	DialTimeout time.Duration
 	// Logger is the logger. If not set, the pool uses [slog.Default].
 	Logger *slog.Logger
+	// Mode selects how the pool opens streams. The default is [ModePool].
+	Mode Mode
 }
 
 // CheckAndSetDefaults validates the config and sets default values.
@@ -118,6 +121,9 @@ func (c *Config) CheckAndSetDefaults() error {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
+	}
+	if c.Mode != ModePool && c.Mode != ModeOnDemand {
+		return trace.BadParameter("unknown callout mode %d", c.Mode)
 	}
 	return nil
 }
@@ -190,6 +196,11 @@ type Pool struct {
 	stop    context.CancelFunc
 	start   sync.Once
 	wg      sync.WaitGroup
+
+	// The fields below are used in on-demand mode only.
+	streamLimiter *rate.Limiter
+	appHandler    atomic.Pointer[func(net.Conn)]
+	dropLog       rate.Sometimes
 }
 
 // New returns a pool that does not dial until [Pool.Start].
@@ -208,12 +219,21 @@ func New(cfg Config) (*Pool, error) {
 		cancel:  cancel,
 		dialCtx: dialCtx,
 		stop:    stop,
+
+		streamLimiter: newStreamLimiter(),
+		dropLog:       rate.Sometimes{Interval: time.Minute},
 	}, nil
 }
 
-// Start opens the WebSockets. Calls after the first do nothing.
+// Start opens the WebSockets: the streams in pool mode, the control socket
+// in on-demand mode. Calls after the first do nothing.
 func (p *Pool) Start() {
 	p.start.Do(func() {
+		if p.cfg.Mode == ModeOnDemand {
+			p.wg.Add(1)
+			go p.runControl()
+			return
+		}
 		for range p.cfg.Size {
 			p.wg.Add(1)
 			go p.run()
@@ -290,13 +310,7 @@ var noRedirectClient = &http.Client{
 // to Accept after the proxy's first data message. It returns nil once a
 // handed-over stream closes.
 func (p *Pool) serveOne(log *slog.Logger) error {
-	var local, remote net.Addr = &net.TCPAddr{}, &net.TCPAddr{}
-	clientTrace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
-		local, remote = info.Conn.LocalAddr(), info.Conn.RemoteAddr()
-	}}
-	ctx, cancel := context.WithTimeout(httptrace.WithClientTrace(p.dialCtx, clientTrace), p.cfg.DialTimeout)
-	ws, _, err := websocket.Dial(ctx, p.cfg.URL.String(), &websocket.DialOptions{HTTPClient: noRedirectClient})
-	cancel()
+	ws, local, remote, err := p.dialWithAddrs(p.cfg.URL.String(), nil)
 	if err != nil {
 		return trace.Wrap(err, "dialing")
 	}
@@ -333,6 +347,23 @@ func (p *Pool) serveOne(log *slog.Logger) error {
 		conn.Close()
 	}
 	return nil
+}
+
+// dialWithAddrs dials a WebSocket to rawURL with extra request headers,
+// and returns it with the local and remote addresses of its TCP
+// connection.
+func (p *Pool) dialWithAddrs(rawURL string, header http.Header) (*websocket.Conn, net.Addr, net.Addr, error) {
+	var local, remote net.Addr = &net.TCPAddr{}, &net.TCPAddr{}
+	clientTrace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+		local, remote = info.Conn.LocalAddr(), info.Conn.RemoteAddr()
+	}}
+	ctx, cancel := context.WithTimeout(httptrace.WithClientTrace(p.dialCtx, clientTrace), p.cfg.DialTimeout)
+	defer cancel()
+	ws, _, err := websocket.Dial(ctx, rawURL, &websocket.DialOptions{HTTPClient: noRedirectClient, HTTPHeader: header})
+	if err != nil {
+		return nil, nil, nil, trace.Wrap(err)
+	}
+	return ws, local, remote, nil
 }
 
 // answerChallenge reads the proxy nonce and writes the auth nonce and the

@@ -1,0 +1,296 @@
+// Teleport
+// Copyright (C) 2026 Gravitational, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+package authcallout
+
+import (
+	"context"
+	"encoding/base64"
+	"log/slog"
+	mathrand "math/rand/v2"
+	"net"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/coder/websocket"
+	"github.com/gravitational/trace"
+	"golang.org/x/time/rate"
+)
+
+// Mode selects how a [Pool] opens streams.
+type Mode int
+
+const (
+	// ModePool keeps [Config.Size] streams open at all times.
+	ModePool Mode = iota
+	// ModeOnDemand keeps one control socket open and opens a stream each
+	// time the proxy asks for one.
+	ModeOnDemand
+)
+
+const (
+	// StreamIDHeader carries the stream id on a stream request in
+	// on-demand mode.
+	StreamIDHeader = "Sallyport-Stream-Id"
+	// controlReadLimit is larger than any control message.
+	controlReadLimit = 256
+	// streamIDSize is the size of a stream id before base64url encoding.
+	streamIDSize = 32
+	// Stream dials in on-demand mode have their own budget: a page load
+	// asks for many streams at once.
+	streamDialBurst      = 32
+	streamDialsPerMinute = 120
+)
+
+// pingEvery is how often the control socket sends "ping", and pongTimeout
+// is how long it then waits for "pong". Tests shorten them.
+var (
+	pingEvery   = 30 * time.Second
+	pongTimeout = 10 * time.Second
+)
+
+// streamKind is the kind of stream the proxy asks for.
+type streamKind string
+
+const (
+	streamAuth streamKind = "auth"
+	streamApp  streamKind = "app"
+)
+
+// SetAppHandler sets the function that serves app streams in on-demand
+// mode. Each app stream is passed to h in its own goroutine. It returns an
+// error unless the pool is in on-demand mode.
+func (p *Pool) SetAppHandler(h func(net.Conn)) error {
+	if p.cfg.Mode != ModeOnDemand {
+		return trace.BadParameter("auth callout is not in on-demand mode")
+	}
+	if h == nil {
+		return trace.BadParameter("missing app handler")
+	}
+	p.appHandler.Store(&h)
+	return nil
+}
+
+// Mode returns the pool's mode.
+func (p *Pool) Mode() Mode { return p.cfg.Mode }
+
+// modeURL returns the callout URL with the mode query parameter set.
+func (p *Pool) modeURL(mode string) string {
+	u := *p.cfg.URL
+	q := u.Query()
+	q.Set("mode", mode)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// runControl keeps the control socket open until the pool stops.
+func (p *Pool) runControl() {
+	defer p.wg.Done()
+	log := p.cfg.Logger.With("url", p.cfg.URL.Redacted())
+	var backoff time.Duration
+	for {
+		if !p.limiter.Allow() {
+			log.WarnContext(p.dialCtx, "auth callout: dial rate limit reached", "dials_per_minute", p.cfg.DialsPerMinute)
+			if err := p.limiter.Wait(p.dialCtx); err != nil {
+				return
+			}
+		}
+		start := time.Now()
+		err := p.serveControl(log)
+		if p.dialCtx.Err() != nil {
+			return
+		}
+		// A control socket that stayed up for a while was healthy, so the
+		// next dial does not wait.
+		if time.Since(start) > maxBackoff {
+			backoff = 0
+		}
+		backoff = min(max(2*backoff, minBackoff), maxBackoff)
+		wait := backoff/2 + mathrand.N(backoff/2)
+		log.DebugContext(p.dialCtx, "auth callout: control socket closed", "error", err, "retry_in", wait)
+		select {
+		case <-time.After(wait):
+		case <-p.dialCtx.Done():
+			return
+		}
+	}
+}
+
+// serveControl dials the control socket, answers the challenge, and serves
+// the proxy's dial requests until the socket closes.
+func (p *Pool) serveControl(log *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(p.dialCtx, p.cfg.DialTimeout)
+	ws, _, err := websocket.Dial(ctx, p.modeURL("control"), &websocket.DialOptions{HTTPClient: noRedirectClient})
+	cancel()
+	if err != nil {
+		return trace.Wrap(err, "dialing control socket")
+	}
+	defer ws.CloseNow()
+	ws.SetReadLimit(controlReadLimit)
+	if err := p.answerChallenge(ws); err != nil {
+		return trace.Wrap(err, "control challenge")
+	}
+	log.DebugContext(p.dialCtx, "auth callout: control socket ready")
+
+	ctx, cancel = context.WithCancel(p.dialCtx)
+	defer cancel()
+	var lastPong atomic.Int64
+	lastPong.Store(time.Now().UnixNano())
+	pingErr := make(chan error, 1)
+	go func() {
+		pingErr <- p.ping(ctx, ws, &lastPong)
+		cancel()
+	}()
+
+	for {
+		typ, msg, err := ws.Read(ctx)
+		if err != nil {
+			select {
+			case perr := <-pingErr:
+				return trace.Wrap(perr)
+			default:
+			}
+			return trace.Wrap(err, "reading control socket")
+		}
+		if typ != websocket.MessageText {
+			return trace.BadParameter("control message is not text")
+		}
+		text := string(msg)
+		if text == "pong" {
+			lastPong.Store(time.Now().UnixNano())
+			continue
+		}
+		kind, id, err := parseDial(text)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		p.dialStream(log, kind, id)
+	}
+}
+
+// ping writes "ping" every [pingEvery] and returns an error when a "pong"
+// is overdue.
+func (p *Pool) ping(ctx context.Context, ws *websocket.Conn, lastPong *atomic.Int64) error {
+	t := time.NewTicker(pingEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+		}
+		sent := time.Now()
+		wctx, cancel := context.WithTimeout(ctx, pongTimeout)
+		err := ws.Write(wctx, websocket.MessageText, []byte("ping"))
+		cancel()
+		if err != nil {
+			return trace.Wrap(err, "writing ping")
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(pongTimeout):
+		}
+		if time.Unix(0, lastPong.Load()).Before(sent) {
+			ws.CloseNow()
+			return trace.ConnectionProblem(nil, "no pong within %v", pongTimeout)
+		}
+	}
+}
+
+// parseDial parses "dial auth <id>" or "dial app <id>". The id must be
+// [streamIDSize] bytes in unpadded base64url.
+func parseDial(text string) (streamKind, string, error) {
+	parts := strings.Split(text, " ")
+	if len(parts) != 3 || parts[0] != "dial" {
+		return "", "", trace.BadParameter("unexpected control message")
+	}
+	kind := streamKind(parts[1])
+	if kind != streamAuth && kind != streamApp {
+		return "", "", trace.BadParameter("unexpected stream kind")
+	}
+	id := parts[2]
+	raw, err := base64.RawURLEncoding.DecodeString(id)
+	if err != nil || len(raw) != streamIDSize || base64.RawURLEncoding.EncodeToString(raw) != id {
+		return "", "", trace.BadParameter("malformed stream id")
+	}
+	return kind, id, nil
+}
+
+// dialStream opens the stream the proxy asked for, unless the stream dial
+// budget is used up or no app handler is set for an app stream.
+func (p *Pool) dialStream(log *slog.Logger, kind streamKind, id string) {
+	var handler func(net.Conn)
+	if kind == streamApp {
+		h := p.appHandler.Load()
+		if h == nil {
+			p.dropLog.Do(func() {
+				log.WarnContext(p.dialCtx, "auth callout: app stream asked for, but no app service is registered")
+			})
+			return
+		}
+		handler = *h
+	}
+	if !p.streamLimiter.Allow() {
+		p.dropLog.Do(func() {
+			log.WarnContext(p.dialCtx, "auth callout: stream dial rate limit reached, dropping dials", "dials_per_minute", streamDialsPerMinute)
+		})
+		return
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		if err := p.serveStream(kind, id, handler); err != nil {
+			log.DebugContext(p.dialCtx, "auth callout: stream failed", "kind", kind, "error", err)
+		}
+	}()
+}
+
+// serveStream opens one stream and hands it to auth's listener or to the
+// app handler. It returns once the stream closes.
+func (p *Pool) serveStream(kind streamKind, id string, handler func(net.Conn)) error {
+	ws, local, remote, err := p.dialWithAddrs(p.modeURL("stream"), http.Header{StreamIDHeader: []string{id}})
+	if err != nil {
+		return trace.Wrap(err, "dialing stream")
+	}
+	ws.SetReadLimit(readLimit)
+	// Streams outlive Stop, so the conn takes ctx, not dialCtx.
+	conn := newConn(p.ctx, ws, nil, local, remote)
+	switch kind {
+	case streamApp:
+		go handler(conn)
+	default:
+		select {
+		case p.conns <- conn:
+		case <-p.dialCtx.Done():
+			conn.Close()
+			return nil
+		}
+	}
+	select {
+	case <-conn.done:
+	case <-p.ctx.Done():
+		conn.Close()
+	}
+	return nil
+}
+
+// newStreamLimiter returns the limiter for stream dials in on-demand mode.
+func newStreamLimiter() *rate.Limiter {
+	return rate.NewLimiter(rate.Limit(float64(streamDialsPerMinute)/60), streamDialBurst)
+}
