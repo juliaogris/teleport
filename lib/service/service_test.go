@@ -2872,7 +2872,7 @@ func calloutHub(t *testing.T, pub ed25519.PublicKey, verified chan<- *websocket.
 		if err != nil {
 			return
 		}
-		ctx := context.Background()
+		ctx := r.Context()
 		nonce := make([]byte, authcallout.NonceSize)
 		rand.Read(nonce)
 		if err := ws.Write(ctx, websocket.MessageBinary, nonce); err != nil {
@@ -2982,7 +2982,7 @@ func onDemandEdge(t *testing.T, pub ed25519.PublicKey, controls, streams chan<- 
 			streams <- ws
 			return
 		}
-		ctx := context.Background()
+		ctx := r.Context()
 		nonce := make([]byte, authcallout.NonceSize)
 		rand.Read(nonce)
 		if err := ws.Write(ctx, websocket.MessageBinary, nonce); err != nil {

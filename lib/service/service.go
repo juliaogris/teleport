@@ -201,6 +201,10 @@ import (
 	"github.com/gravitational/teleport/session/selinux"
 )
 
+// calloutAppsReadyTimeout is how long an on-demand auth callout waits for
+// the app service in the same process before it starts without it.
+const calloutAppsReadyTimeout = time.Minute
+
 const (
 	// AuthIdentityEvent is generated when the Auth Servers identity has been
 	// initialized in the backend.
@@ -2829,7 +2833,12 @@ func (process *TeleportProcess) initAuthService() error {
 		if cfg.Auth.CalloutMode == servicecfg.CalloutModeOnDemand {
 			mode = authcallout.ModeOnDemand
 		}
-		calloutPool, err = authcallout.New(authcallout.Config{URL: cfg.Auth.CalloutTo, Key: key, Logger: logger, Mode: mode})
+		calloutPool, err = authcallout.New(authcallout.Config{
+			URL:    cfg.Auth.CalloutTo,
+			Key:    key,
+			Logger: logger,
+			Mode:   mode,
+		})
 		if err != nil {
 			listener.Close()
 			return trace.Wrap(err)
@@ -2892,10 +2901,18 @@ func (process *TeleportProcess) initAuthService() error {
 			}
 			// An app dial that arrives before the app service has set
 			// its handler would be dropped, so an on-demand callout with
-			// apps in this process also waits for the apps.
+			// apps in this process also waits for the apps. The wait is
+			// bounded so that an app service that never starts does not
+			// keep auth off the proxy.
 			if calloutPool.Mode() == authcallout.ModeOnDemand && cfg.Apps.Enabled {
-				if _, err := process.WaitForEvent(process.GracefulExitContext(), AppsReady); err != nil {
+				appsCtx, cancel := context.WithTimeout(process.GracefulExitContext(), calloutAppsReadyTimeout)
+				_, err := process.WaitForEvent(appsCtx, AppsReady)
+				cancel()
+				if process.GracefulExitContext().Err() != nil {
 					return nil
+				}
+				if err != nil {
+					logger.WarnContext(process.ExitContext(), "Starting auth callout before the app service is ready. App dials are refused until it is.", "waited", calloutAppsReadyTimeout)
 				}
 			}
 			logger.InfoContext(process.ExitContext(), "Starting auth callout.", "url", cfg.Auth.CalloutTo.Redacted())
@@ -6926,9 +6943,9 @@ func (process *TeleportProcess) initApps() {
 		// If it was not, it is running in single process mode which is used for
 		// development and demos. In that case, wait until all dependencies (like
 		// auth and reverse tunnel server) are ready before starting.
-		// With an on-demand auth callout in this process, the proxy opens
-		// app connections through the callout. There is no reverse tunnel,
-		// so the app service needs no proxy and does not wait for one.
+
+		// With an on-demand auth callout in this process there is no
+		// reverse tunnel, so there is no proxy to wait for.
 		serveThroughCallout := process.authCallout != nil && process.authCallout.Mode() == authcallout.ModeOnDemand
 		tunnelAddrResolver := conn.TunnelProxyResolver()
 		if tunnelAddrResolver == nil && !serveThroughCallout {
