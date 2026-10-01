@@ -285,7 +285,7 @@ func TestOnDemandRefusesDroppedDial(t *testing.T) {
 		e.refuses = true
 		p := newOnDemandPool(t, e.url(t), priv)
 		ctl := e.control(t)
-		p.streamLimiter.SetBurst(0)
+		p.streamLimiters[streamAuth].SetBurst(0)
 
 		id := newStreamID(t)
 		sendDial(t, ctl, "auth", id)
@@ -379,9 +379,11 @@ func TestOnDemandDialRateLimited(t *testing.T) {
 	for range streamDialBurst {
 		e.stream(t)
 	}
-	// One more stream may come from the refill during the test.
+	// A few more streams may come from the refill during the test.
+	window := 300 * time.Millisecond
+	refills := int(window.Seconds()*streamDialsPerMinute/60) + 1
 	extra := 0
-	timeout := time.After(300 * time.Millisecond)
+	timeout := time.After(window)
 	for done := false; !done; {
 		select {
 		case s := <-e.streams:
@@ -391,7 +393,22 @@ func TestOnDemandDialRateLimited(t *testing.T) {
 			done = true
 		}
 	}
-	require.LessOrEqual(t, extra, 1)
+	require.LessOrEqual(t, extra, refills)
+}
+
+func TestOnDemandDialBudgetPerKind(t *testing.T) {
+	pub, priv := newKey(t)
+	e := newLazyEdge(t, pub)
+	p := newOnDemandPool(t, e.url(t), priv)
+	require.NoError(t, p.SetAppHandler(func(c net.Conn) { c.Close() }))
+	ctl := e.control(t)
+	p.streamLimiters[streamAuth].SetBurst(0)
+
+	sendDial(t, ctl, "auth", newStreamID(t))
+	id := newStreamID(t)
+	sendDial(t, ctl, "app", id)
+	s := e.stream(t)
+	require.Equal(t, id, s.id)
 }
 
 func TestSetAppHandlerNeedsOnDemand(t *testing.T) {

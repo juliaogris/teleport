@@ -242,10 +242,10 @@ type Pool struct {
 	wg      sync.WaitGroup
 
 	// These fields are used in on-demand mode only.
-	streamLimiter *rate.Limiter
-	openStreams   atomic.Int32
-	appHandler    atomic.Pointer[func(net.Conn)]
-	dropLogs      dropLogs
+	streamLimiters map[streamKind]*rate.Limiter
+	openStreams    atomic.Int32
+	appHandler     atomic.Pointer[func(net.Conn)]
+	dropLogs       dropLogs
 }
 
 // New returns a pool that does not dial until [Pool.Start].
@@ -265,8 +265,8 @@ func New(cfg Config) (*Pool, error) {
 		dialCtx: dialCtx,
 		stop:    stop,
 
-		streamLimiter: newStreamLimiter(),
-		dropLogs:      newDropLogs(),
+		streamLimiters: newStreamLimiters(),
+		dropLogs:       newDropLogs(),
 	}, nil
 }
 

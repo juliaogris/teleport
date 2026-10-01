@@ -67,10 +67,12 @@ const (
 	controlWriteTimeout = 10 * time.Second
 	// streamIDSize is the size of a stream id before base64url encoding.
 	streamIDSize = 32
-	// Stream dials in on-demand mode have their own budget: a page load
-	// asks for many streams at once.
-	streamDialBurst      = 32
-	streamDialsPerMinute = 120
+	// Stream dials in on-demand mode have their own budget per stream
+	// kind, so that login traffic cannot use up the app budget. A cold
+	// page load asks for one app stream per asset, all at once, and
+	// maxStreams bounds a proxy that keeps asking.
+	streamDialBurst      = 128
+	streamDialsPerMinute = 480
 	// maxStreams caps the streams open at once in on-demand mode.
 	maxStreams = 256
 	// maxControlBackoff is the longest wait before redialing a control
@@ -296,9 +298,9 @@ func (p *Pool) dialStream(log *slog.Logger, kind streamKind, id string) bool {
 		})
 		return false
 	}
-	if !p.streamLimiter.Allow() {
+	if !p.streamLimiters[kind].Allow() {
 		p.dropLogs.overBudget.Do(func() {
-			log.WarnContext(p.dialCtx, "auth callout: stream dial rate limit reached, dropping dials", "dials_per_minute", streamDialsPerMinute)
+			log.WarnContext(p.dialCtx, "auth callout: stream dial rate limit reached, dropping dials", "kind", kind, "dials_per_minute", streamDialsPerMinute)
 		})
 		return false
 	}
@@ -359,7 +361,11 @@ func (p *Pool) serveStream(kind streamKind, id string, handler func(net.Conn)) e
 	return nil
 }
 
-// newStreamLimiter returns the limiter for stream dials in on-demand mode.
-func newStreamLimiter() *rate.Limiter {
-	return rate.NewLimiter(rate.Limit(float64(streamDialsPerMinute)/60), streamDialBurst)
+// newStreamLimiters returns one stream dial limiter per stream kind.
+func newStreamLimiters() map[streamKind]*rate.Limiter {
+	limiters := map[streamKind]*rate.Limiter{}
+	for _, kind := range []streamKind{streamAuth, streamApp} {
+		limiters[kind] = rate.NewLimiter(rate.Limit(float64(streamDialsPerMinute)/60), streamDialBurst)
+	}
+	return limiters
 }
