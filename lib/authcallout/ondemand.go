@@ -368,7 +368,7 @@ func (p *Pool) serveStream(kind streamKind, id string, handler func(net.Conn)) e
 	}
 	ws.SetReadLimit(readLimit)
 	// Streams outlive Stop, so the conn takes ctx, not dialCtx.
-	conn := newFlowConn(p.ctx, ws, local, remote)
+	conn := newFlowConn(p.ctx, ws, local, remote, p.cfg.streamIdle)
 	switch kind {
 	case streamApp:
 		go handler(conn)
@@ -376,14 +376,14 @@ func (p *Pool) serveStream(kind streamKind, id string, handler func(net.Conn)) e
 		select {
 		case p.conns <- conn:
 		case <-p.dialCtx.Done():
-			conn.Close()
+			conn.closeWith(websocket.StatusGoingAway)
 			return nil
 		}
 	}
 	select {
 	case <-conn.done:
 	case <-p.ctx.Done():
-		conn.Close()
+		conn.closeWith(websocket.StatusGoingAway)
 	}
 	return nil
 }

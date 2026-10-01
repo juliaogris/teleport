@@ -64,6 +64,12 @@
 //     request carries the header "Sallyport-Stream: ack" to say that the
 //     pool acknowledges. A proxy that does not read the header applies no
 //     window to what it sends.
+//  6. The pool closes a stream with status 1000 only once the app's side
+//     is done with it. A stream the pool cuts short carries another
+//     status: 1001 when the pool closes, 1008 when the proxy broke a rule
+//     or left the stream idle, 1011 when the WebSocket failed. The pool
+//     cannot tell whether an HTTP response the app's side closed was
+//     complete, so a proxy must take that from the response's framing.
 //
 // An app stream is TLS from the proxy to the app service, as a reverse
 // tunnel connection would be. The pool authenticates the proxy only by the
@@ -145,6 +151,9 @@ type Config struct {
 	// maxControlBackoff the longest wait before redialing a control
 	// socket in on-demand mode. Tests shorten them.
 	minBackoff, maxControlBackoff time.Duration
+	// streamIdle closes an on-demand stream that has carried no bytes
+	// either way for this long. Tests shorten it.
+	streamIdle time.Duration
 }
 
 // CheckAndSetDefaults validates the config and sets default values.
@@ -181,6 +190,9 @@ func (c *Config) CheckAndSetDefaults() error {
 	}
 	if c.maxControlBackoff <= 0 {
 		c.maxControlBackoff = defaultMaxControlBackoff
+	}
+	if c.streamIdle <= 0 {
+		c.streamIdle = defaultStreamIdle
 	}
 	if c.Mode != ModePool && c.Mode != ModeOnDemand {
 		return trace.BadParameter("unknown callout mode %d", c.Mode)

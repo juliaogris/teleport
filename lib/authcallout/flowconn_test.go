@@ -36,10 +36,10 @@ type appStream struct {
 }
 
 // dialAppStream opens an on-demand app stream.
-func dialAppStream(t *testing.T) appStream {
+func dialAppStream(t *testing.T, opts ...func(*Config)) appStream {
 	pub, priv := newKey(t)
 	e := newLazyEdge(t, pub)
-	p := newOnDemandPool(t, e.url(t), priv)
+	p := newOnDemandPool(t, e.url(t), priv, opts...)
 	got := make(chan net.Conn, 1)
 	require.NoError(t, p.SetAppHandler(func(c net.Conn) { got <- c }))
 	sendDial(t, e.control(t), "app", newStreamID(t))
@@ -157,11 +157,19 @@ func TestFlowConnCloseSendsCloseFrame(t *testing.T) {
 	require.Equal(t, websocket.StatusNormalClosure, websocket.CloseStatus(err))
 }
 
-func TestFlowConnPoolCloseSendsCloseFrame(t *testing.T) {
+func TestFlowConnPoolCloseSendsGoingAway(t *testing.T) {
 	s := dialAppStream(t)
 	require.NoError(t, s.pool.Close())
 	err := readUntilClosed(t, s.edge)
-	require.Equal(t, websocket.StatusNormalClosure, websocket.CloseStatus(err))
+	require.Equal(t, websocket.StatusGoingAway, websocket.CloseStatus(err))
+}
+
+func TestFlowConnIdleClosesWithPolicyViolation(t *testing.T) {
+	s := dialAppStream(t, func(c *Config) { c.streamIdle = 100 * time.Millisecond })
+	err := readUntilClosed(t, s.edge)
+	require.Equal(t, websocket.StatusPolicyViolation, websocket.CloseStatus(err))
+	_, err = s.conn.Read(make([]byte, 1))
+	require.ErrorIs(t, err, net.ErrClosed)
 }
 
 func TestFlowConnCloseUnblocksWrite(t *testing.T) {
@@ -192,6 +200,8 @@ func TestFlowConnBadAckCloses(t *testing.T) {
 			require.NoError(t, s.edge.Write(t.Context(), websocket.MessageText, []byte(ack)))
 			_, err := s.conn.Read(make([]byte, 1))
 			require.Error(t, err)
+			err = readUntilClosed(t, s.edge)
+			require.Equal(t, websocket.StatusPolicyViolation, websocket.CloseStatus(err))
 		})
 	}
 }
@@ -235,4 +245,6 @@ func TestFlowConnTooMuchUnreadCloses(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the stream stayed open with more than maxPendingRead unread")
 	}
+	err := readUntilClosed(t, s.edge)
+	require.Equal(t, websocket.StatusPolicyViolation, websocket.CloseStatus(err))
 }

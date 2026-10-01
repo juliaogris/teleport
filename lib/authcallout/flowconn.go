@@ -45,11 +45,11 @@ const (
 	// before an ack. Only a proxy without the window reaches this limit,
 	// and an upload to an app that reads slower than the link then fails.
 	maxPendingRead = 8 << 20
-	// streamIdle closes a stream that has carried no bytes either way for
-	// this long, so that a proxy that stops acking or never closes cannot
-	// keep a stream and its goroutines forever. The proxy closes idle
-	// streams after 30 seconds.
-	streamIdle = 2 * time.Minute
+	// defaultStreamIdle closes a stream that has carried no bytes either
+	// way for this long, so that a proxy that stops acking or never closes
+	// cannot keep a stream and its goroutines forever. The proxy closes
+	// idle streams after 30 seconds.
+	defaultStreamIdle = 2 * time.Minute
 	// closeTimeout bounds the WebSocket close handshake.
 	closeTimeout = 5 * time.Second
 )
@@ -59,9 +59,16 @@ const (
 // is the total number of stream bytes it has passed on, and keeps at most
 // [streamWindow] bytes unacknowledged. A reader goroutine reads the
 // WebSocket at all times, so acks arrive even while nobody calls Read.
+//
+// The close status tells the proxy who ended the stream. Close, which the
+// app's side calls once it is done with the conn, sends 1000. A close the
+// conn starts itself sends another status: 1001 when the pool closes,
+// 1008 when the proxy broke a rule or left the stream idle, and 1011 when
+// the WebSocket failed. Only 1000 means the app's side ended normally.
 type flowConn struct {
 	ws            *websocket.Conn
 	local, remote net.Addr
+	idle          time.Duration
 
 	mu      sync.Mutex
 	cond    *sync.Cond
@@ -92,13 +99,14 @@ type flowConn struct {
 }
 
 // newFlowConn wraps ws and starts its reader. Cancelling ctx closes the
-// conn.
-func newFlowConn(ctx context.Context, ws *websocket.Conn, local, remote net.Addr) *flowConn {
+// conn with 1001, and idle without bytes either way closes it with 1008.
+func newFlowConn(ctx context.Context, ws *websocket.Conn, local, remote net.Addr, idle time.Duration) *flowConn {
 	ctx, cancel := context.WithCancel(ctx)
 	c := &flowConn{
 		ws:     ws,
 		local:  local,
 		remote: remote,
+		idle:   idle,
 		active: time.Now(),
 		done:   make(chan struct{}),
 		ctx:    ctx,
@@ -109,15 +117,14 @@ func newFlowConn(ctx context.Context, ws *websocket.Conn, local, remote net.Addr
 	go c.closeWhenIdle()
 	go func() {
 		<-ctx.Done()
-		c.Close()
+		c.closeWith(websocket.StatusGoingAway)
 	}()
 	return c
 }
 
-// closeWhenIdle closes the conn once no bytes have crossed for
-// [streamIdle].
+// closeWhenIdle closes the conn once no bytes have crossed for c.idle.
 func (c *flowConn) closeWhenIdle() {
-	t := time.NewTimer(streamIdle)
+	t := time.NewTimer(c.idle)
 	defer t.Stop()
 	for {
 		select {
@@ -128,11 +135,11 @@ func (c *flowConn) closeWhenIdle() {
 		c.mu.Lock()
 		idle := time.Since(c.active)
 		c.mu.Unlock()
-		if idle >= streamIdle {
-			c.Close()
+		if idle >= c.idle {
+			c.closeWith(websocket.StatusPolicyViolation)
 			return
 		}
-		t.Reset(streamIdle - idle)
+		t.Reset(c.idle - idle)
 	}
 }
 
@@ -146,11 +153,11 @@ func (c *flowConn) readLoop() {
 	for {
 		typ, msg, err := c.ws.Read(context.Background())
 		if err != nil {
-			c.fail(readError(err))
+			c.fail(readError(err), websocket.StatusInternalError)
 			return
 		}
 		if err := c.receive(typ, msg); err != nil {
-			c.fail(err)
+			c.fail(err, websocket.StatusPolicyViolation)
 			return
 		}
 	}
@@ -188,16 +195,17 @@ func (c *flowConn) receive(typ websocket.MessageType, msg []byte) error {
 	return nil
 }
 
-// fail records err as the error of every later Read and closes the conn.
+// fail records err as the error of every later Read and closes the conn
+// with code.
 //
 // A WebSocket that cannot be read carries no more acks, so a writer would
 // otherwise wait for good.
-func (c *flowConn) fail(err error) {
+func (c *flowConn) fail(err error, code websocket.StatusCode) {
 	c.mu.Lock()
 	c.readErr = err
 	c.cond.Broadcast()
 	c.mu.Unlock()
-	c.Close()
+	c.closeWith(code)
 }
 
 // parseAck parses "ack <n>".
@@ -351,19 +359,26 @@ func (c *flowConn) wait(deadline time.Time) {
 	t.Stop()
 }
 
-// Close closes the WebSocket with a close handshake. It interrupts a
-// blocked Read or Write.
+// Close closes the WebSocket with status 1000, which tells the proxy that
+// the app's side is done with the stream. It interrupts a blocked Read or
+// Write.
 func (c *flowConn) Close() error {
+	c.closeWith(websocket.StatusNormalClosure)
+	return nil
+}
+
+// closeWith closes the WebSocket with code, once. Later calls with any
+// code do nothing.
+func (c *flowConn) closeWith(code websocket.StatusCode) {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closed = true
 		c.cond.Broadcast()
 		c.mu.Unlock()
-		closeGracefully(c.ws, websocket.StatusNormalClosure)
+		closeGracefully(c.ws, code)
 		c.cancel()
 		close(c.done)
 	})
-	return nil
 }
 
 // closeGracefully performs the close handshake with code, and drops the
