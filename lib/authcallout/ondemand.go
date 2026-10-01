@@ -19,6 +19,7 @@ package authcallout
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"log/slog"
 	mathrand "math/rand/v2"
 	"net"
@@ -75,10 +76,17 @@ const (
 	streamDialsPerMinute = 480
 	// maxStreams caps the streams open at once in on-demand mode.
 	maxStreams = 256
-	// maxControlBackoff is the longest wait before redialing a control
-	// socket that the proxy refused or that closed within shortControl.
-	maxControlBackoff = 10 * time.Minute
-	shortControl      = 10 * time.Second
+	// defaultMaxControlBackoff is the longest wait before redialing a
+	// control socket that the proxy refused or replaced, or that closed
+	// within shortControl.
+	defaultMaxControlBackoff = 10 * time.Minute
+	shortControl             = 10 * time.Second
+	// healthyControl is how long a control socket must stay open for the
+	// next dial to wait only minBackoff.
+	healthyControl = 30 * time.Second
+	// replacedReason is the close reason the proxy gives a control socket
+	// that a newer one replaced.
+	replacedReason = "replaced"
 )
 
 const (
@@ -142,19 +150,7 @@ func (p *Pool) runControl() {
 		if p.dialCtx.Err() != nil {
 			return
 		}
-		// A control socket that stayed up for a while was healthy, so the
-		// next dial does not wait.
-		if time.Since(start) > maxBackoff {
-			backoff = 0
-		}
-		// Each dial wakes the proxy if it sleeps. A proxy that refuses the
-		// socket, or another auth process that keeps replacing it, would
-		// otherwise wake it every 30 seconds for good.
-		limit := maxBackoff
-		if websocket.CloseStatus(err) == websocket.StatusPolicyViolation || time.Since(start) < shortControl {
-			limit = maxControlBackoff
-		}
-		backoff = min(max(2*backoff, minBackoff), limit)
+		backoff = p.nextControlBackoff(backoff, time.Since(start), err)
 		wait := backoff/2 + mathrand.N(backoff/2)
 		log.WarnContext(p.dialCtx, "auth callout: control socket closed", "error", err, "retry_in", wait)
 		select {
@@ -163,6 +159,30 @@ func (p *Pool) runControl() {
 			return
 		}
 	}
+}
+
+// nextControlBackoff returns the backoff before the next control dial,
+// given the previous backoff and how long the last socket lived before it
+// closed with err.
+//
+// Each dial wakes a proxy that sleeps. A proxy that refuses the socket
+// (1008) or replaces it with another auth process's socket, or a socket
+// that closes within shortControl, would otherwise wake the proxy every
+// maxBackoff for good, so those grow the backoff up to
+// Config.maxControlBackoff. A proxy that evicted the socket to make room
+// (1013) wants another try soon, so that backoff stays at Config.minBackoff.
+func (p *Pool) nextControlBackoff(backoff, lasted time.Duration, err error) time.Duration {
+	var closeErr websocket.CloseError
+	errors.As(err, &closeErr)
+	switch {
+	case closeErr.Code == websocket.StatusTryAgainLater:
+		return p.cfg.minBackoff
+	case closeErr.Code == websocket.StatusPolicyViolation, closeErr.Reason == replacedReason, lasted < shortControl:
+		return min(max(2*backoff, p.cfg.minBackoff), p.cfg.maxControlBackoff)
+	case lasted >= healthyControl:
+		return p.cfg.minBackoff
+	}
+	return min(max(2*backoff, p.cfg.minBackoff), maxBackoff)
 }
 
 // serveControl dials the control socket, answers the challenge, and serves

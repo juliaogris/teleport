@@ -367,6 +367,54 @@ func TestOnDemandRedialsAfterClose(t *testing.T) {
 	e.control(t)
 }
 
+func TestNextControlBackoff(t *testing.T) {
+	const minBackoff, maxControlBackoff = 100 * time.Millisecond, 10 * time.Minute
+	p := &Pool{cfg: Config{minBackoff: minBackoff, maxControlBackoff: maxControlBackoff}}
+	closed := func(code websocket.StatusCode, reason string) error {
+		return websocket.CloseError{Code: code, Reason: reason}
+	}
+	for _, tc := range []struct {
+		name    string
+		backoff time.Duration
+		lasted  time.Duration
+		err     error
+		want    time.Duration
+	}{
+		{name: "normal close after a healthy socket", backoff: 8 * time.Second, lasted: time.Minute, err: closed(websocket.StatusNormalClosure, ""), want: minBackoff},
+		{name: "network error after a healthy socket", backoff: 8 * time.Second, lasted: time.Minute, err: io.EOF, want: minBackoff},
+		{name: "network error after a medium socket", backoff: minBackoff, lasted: 20 * time.Second, err: io.EOF, want: 2 * minBackoff},
+		{name: "network error after a medium socket stops at maxBackoff", backoff: maxBackoff, lasted: 20 * time.Second, err: io.EOF, want: maxBackoff},
+		{name: "short socket", backoff: 0, lasted: time.Second, err: closed(websocket.StatusNormalClosure, ""), want: minBackoff},
+		{name: "short socket grows", backoff: minBackoff, lasted: time.Second, err: closed(websocket.StatusNormalClosure, ""), want: 2 * minBackoff},
+		{name: "short socket grows past maxBackoff", backoff: maxBackoff, lasted: time.Second, err: io.EOF, want: 2 * maxBackoff},
+		{name: "short socket stops at maxControlBackoff", backoff: maxControlBackoff, lasted: time.Second, err: io.EOF, want: maxControlBackoff},
+		{name: "policy violation after a healthy socket grows", backoff: minBackoff, lasted: time.Minute, err: closed(websocket.StatusPolicyViolation, "bad signature"), want: 2 * minBackoff},
+		{name: "replaced after a healthy socket grows", backoff: minBackoff, lasted: time.Minute, err: closed(websocket.StatusNormalClosure, replacedReason), want: 2 * minBackoff},
+		{name: "try again later stays at minBackoff", backoff: 8 * time.Second, lasted: time.Second, err: closed(websocket.StatusTryAgainLater, "too many sockets in the challenge"), want: minBackoff},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := p.nextControlBackoff(tc.backoff, tc.lasted, tc.err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestOnDemandBacksOffAfterPolicyViolation(t *testing.T) {
+	const minBackoff = 100 * time.Millisecond
+	pub, priv := newKey(t)
+	e := newLazyEdge(t, pub)
+	newOnDemandPool(t, e.url(t), priv, func(c *Config) { c.minBackoff = minBackoff })
+
+	// The first 1008 sets the backoff to minBackoff, the second doubles
+	// it, so the third dial waits at least minBackoff.
+	e.control(t).Close(websocket.StatusPolicyViolation, "bad signature")
+	second := e.control(t)
+	closedAt := time.Now()
+	second.Close(websocket.StatusPolicyViolation, "bad signature")
+	e.control(t)
+	require.GreaterOrEqual(t, time.Since(closedAt), minBackoff)
+}
+
 func TestOnDemandDialRateLimited(t *testing.T) {
 	pub, priv := newKey(t)
 	e := newLazyEdge(t, pub)

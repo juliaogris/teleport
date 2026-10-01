@@ -110,9 +110,9 @@ const (
 	defaultDialsPerMinute = 60
 	// readLimit is larger than any message the proxy writes. A message is
 	// one or more TLS records.
-	readLimit  = 128 * 1024
-	minBackoff = 250 * time.Millisecond
-	maxBackoff = 30 * time.Second
+	readLimit         = 128 * 1024
+	defaultMinBackoff = 250 * time.Millisecond
+	maxBackoff        = 30 * time.Second
 )
 
 // Config is the configuration for a [Pool].
@@ -135,6 +135,10 @@ type Config struct {
 	// pingEvery and pongTimeout time the control socket's ping in
 	// on-demand mode. Tests shorten them.
 	pingEvery, pongTimeout time.Duration
+	// minBackoff is the shortest wait before a redial, and
+	// maxControlBackoff the longest wait before redialing a control
+	// socket in on-demand mode. Tests shorten them.
+	minBackoff, maxControlBackoff time.Duration
 }
 
 // CheckAndSetDefaults validates the config and sets default values.
@@ -165,6 +169,12 @@ func (c *Config) CheckAndSetDefaults() error {
 	}
 	if c.pongTimeout <= 0 {
 		c.pongTimeout = defaultPongTimeout
+	}
+	if c.minBackoff <= 0 {
+		c.minBackoff = defaultMinBackoff
+	}
+	if c.maxControlBackoff <= 0 {
+		c.maxControlBackoff = defaultMaxControlBackoff
 	}
 	if c.Mode != ModePool && c.Mode != ModeOnDemand {
 		return trace.BadParameter("unknown callout mode %d", c.Mode)
@@ -331,7 +341,7 @@ func (p *Pool) run() {
 			backoff = 0
 			continue
 		}
-		backoff = min(max(2*backoff, minBackoff), maxBackoff)
+		backoff = min(max(2*backoff, p.cfg.minBackoff), maxBackoff)
 		// Jitter spreads the redials when the proxy drops every WebSocket.
 		wait := backoff/2 + mathrand.N(backoff/2)
 		log.DebugContext(p.dialCtx, "auth callout: stream failed", "error", err, "retry_in", wait)
