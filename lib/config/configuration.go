@@ -27,6 +27,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -951,8 +952,8 @@ func applyAuthConfig(fc *FileConfig, cfg *servicecfg.Config) error {
 		}
 		cfg.Auth.CalloutMode = servicecfg.CalloutModeOnDemand
 	default:
-		return trace.BadParameter("auth_service.callout_mode must be %q or %q, got %q",
-			servicecfg.CalloutModePool, servicecfg.CalloutModeOnDemand, fc.Auth.CalloutMode)
+		want := fmt.Sprintf("%q or %q", servicecfg.CalloutModePool, servicecfg.CalloutModeOnDemand)
+		return trace.BadParameter("auth_service.callout_mode must be %s, got %q", want, fc.Auth.CalloutMode)
 	}
 
 	if fc.Auth.ListenAddress != "" {
