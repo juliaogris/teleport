@@ -307,6 +307,17 @@ func TestOnDemandRefusesDroppedDial(t *testing.T) {
 		requireRefuse(t, ctl, id)
 		e.noStream(t, 200*time.Millisecond)
 	})
+
+	// Stop sends the close frame before a refuse could follow it.
+	t.Run("shutting down", func(t *testing.T) {
+		pub, priv := newKey(t)
+		e := newLazyEdge(t, pub)
+		p := newOnDemandPool(t, e.url(t), priv)
+		e.control(t)
+		p.Stop()
+		require.False(t, p.dialStream(p.cfg.Logger, streamAuth, newStreamID(t)))
+		e.noStream(t, 200*time.Millisecond)
+	})
 }
 
 func TestOnDemandBadMessageClosesControl(t *testing.T) {

@@ -262,7 +262,8 @@ func (p *Pool) serveDials(ctx context.Context, ws *websocket.Conn, log *slog.Log
 		if p.dialStream(log, kind, id) || !refuses {
 			continue
 		}
-		if err := writeControl(ctx, ws, "refuse "+id); err != nil {
+		// The write outlives Stop, so a dial read during Stop is refused.
+		if err := writeControl(p.ctx, ws, "refuse "+id); err != nil {
 			return websocket.StatusInternalError, trace.Wrap(err, "writing refuse")
 		}
 	}
@@ -322,10 +323,14 @@ func parseDial(text string) (streamKind, string, error) {
 	return kind, id, nil
 }
 
-// dialStream opens the stream the proxy asked for and reports whether it
-// did. It opens none when no app handler is set for an app stream, when
-// [maxStreams] are open, or when the stream dial budget is used up.
+// dialStream opens the stream the proxy asked for and returns true when it
+// did. It opens none after [Pool.Stop], when no app handler is set for an
+// app stream, when [maxStreams] are open, or when the stream dial budget
+// is used up.
 func (p *Pool) dialStream(log *slog.Logger, kind streamKind, id string) bool {
+	if p.dialCtx.Err() != nil {
+		return false
+	}
 	var handler func(net.Conn)
 	if kind == streamApp {
 		h := p.appHandler.Load()
