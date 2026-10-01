@@ -57,15 +57,15 @@ type flowConn struct {
 	ws            *websocket.Conn
 	local, remote net.Addr
 
-	mu      sync.Mutex
-	cond    *sync.Cond
-	pending []byte
-	readErr error
-	sent    int64
-	acked   int64
-	closed  bool
-	// rdl and wdl are the read and write deadlines.
-	rdl, wdl time.Time
+	mu            sync.Mutex
+	cond          *sync.Cond
+	pending       []byte
+	readErr       error
+	sent          int64
+	acked         int64
+	closed        bool
+	readDeadline  time.Time
+	writeDeadline time.Time
 
 	// active is when bytes last crossed in either direction.
 	active time.Time
@@ -81,7 +81,15 @@ type flowConn struct {
 // conn.
 func newFlowConn(ctx context.Context, ws *websocket.Conn, local, remote net.Addr) *flowConn {
 	ctx, cancel := context.WithCancel(ctx)
-	c := &flowConn{ws: ws, local: local, remote: remote, done: make(chan struct{}), ctx: ctx, cancel: cancel, active: time.Now()}
+	c := &flowConn{
+		ws:     ws,
+		local:  local,
+		remote: remote,
+		active: time.Now(),
+		done:   make(chan struct{}),
+		ctx:    ctx,
+		cancel: cancel,
+	}
 	c.cond = sync.NewCond(&c.mu)
 	go c.readLoop()
 	go c.closeWhenIdle()
@@ -119,42 +127,49 @@ func (c *flowConn) closeWhenIdle() {
 func (c *flowConn) readLoop() {
 	for {
 		typ, msg, err := c.ws.Read(c.ctx)
-		c.mu.Lock()
 		if err != nil {
-			c.readErr = err
-			c.cond.Broadcast()
-			c.mu.Unlock()
-			// A WebSocket that cannot be read carries no more acks, so a
-			// writer would wait for good. Close it.
-			c.Close()
+			c.fail(err)
 			return
 		}
-		switch typ {
-		case websocket.MessageBinary:
-			if len(c.pending)+len(msg) > maxPendingRead {
-				c.readErr = trace.LimitExceeded("more than %d stream bytes wait for a reader", maxPendingRead)
-				c.cond.Broadcast()
-				c.mu.Unlock()
-				c.Close()
-				return
-			}
-			c.pending = append(c.pending, msg...)
-			c.active = time.Now()
-		case websocket.MessageText:
-			n, ok := parseAck(string(msg))
-			if !ok || n > c.sent || n < c.acked {
-				c.readErr = trace.BadParameter("bad ack on stream")
-				c.cond.Broadcast()
-				c.mu.Unlock()
-				c.Close()
-				return
-			}
-			c.acked = n
-			c.active = time.Now()
+		if err := c.receive(typ, msg); err != nil {
+			c.fail(err)
+			return
 		}
-		c.cond.Broadcast()
-		c.mu.Unlock()
 	}
+}
+
+// receive queues a binary message for Read or applies a text ack.
+func (c *flowConn) receive(typ websocket.MessageType, msg []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	defer c.cond.Broadcast()
+	switch typ {
+	case websocket.MessageBinary:
+		if len(c.pending)+len(msg) > maxPendingRead {
+			return trace.LimitExceeded("more than %d stream bytes wait for a reader", maxPendingRead)
+		}
+		c.pending = append(c.pending, msg...)
+	case websocket.MessageText:
+		n, ok := parseAck(string(msg))
+		if !ok || n > c.sent || n < c.acked {
+			return trace.BadParameter("bad ack on stream")
+		}
+		c.acked = n
+	}
+	c.active = time.Now()
+	return nil
+}
+
+// fail records err as the error of every later Read and closes the conn.
+//
+// A WebSocket that cannot be read carries no more acks, so a writer would
+// otherwise wait for good.
+func (c *flowConn) fail(err error) {
+	c.mu.Lock()
+	c.readErr = err
+	c.cond.Broadcast()
+	c.mu.Unlock()
+	c.Close()
 }
 
 // parseAck parses "ack <n>".
@@ -178,10 +193,10 @@ func (c *flowConn) Read(b []byte) (int, error) {
 		if c.readErr != nil {
 			return 0, c.readErr
 		}
-		if !c.rdl.IsZero() && !time.Now().Before(c.rdl) {
+		if deadlinePassed(c.readDeadline) {
 			return 0, timeoutError{}
 		}
-		c.wait(c.rdl)
+		c.wait(c.readDeadline)
 	}
 	n := copy(b, c.pending)
 	c.pending = c.pending[n:]
@@ -197,9 +212,9 @@ func (c *flowConn) Write(b []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	c.mu.Lock()
-	wdl := c.wdl
+	deadline := c.writeDeadline
 	c.mu.Unlock()
-	if !wdl.IsZero() && !time.Now().Before(wdl) {
+	if deadlinePassed(deadline) {
 		return 0, timeoutError{}
 	}
 	written := 0
@@ -216,20 +231,17 @@ func (c *flowConn) Write(b []byte) (int, error) {
 				c.mu.Unlock()
 				return written, err
 			}
-			if !c.wdl.IsZero() && !time.Now().Before(c.wdl) {
+			if deadlinePassed(c.writeDeadline) {
 				c.mu.Unlock()
 				return written, timeoutError{}
 			}
-			c.wait(c.wdl)
+			c.wait(c.writeDeadline)
 		}
 		c.sent += int64(len(chunk))
 		c.active = time.Now()
-		wdl := c.wdl
+		deadline := c.writeDeadline
 		c.mu.Unlock()
-		ctx, cancel := c.ctx, context.CancelFunc(func() {})
-		if !wdl.IsZero() {
-			ctx, cancel = context.WithDeadline(c.ctx, wdl)
-		}
+		ctx, cancel := c.writeContext(deadline)
 		err := c.ws.Write(ctx, websocket.MessageBinary, chunk)
 		cancel()
 		if err != nil {
@@ -239,7 +251,7 @@ func (c *flowConn) Write(b []byte) (int, error) {
 			if closed {
 				return written, net.ErrClosed
 			}
-			if !wdl.IsZero() && !time.Now().Before(wdl) {
+			if deadlinePassed(deadline) {
 				return written, timeoutError{}
 			}
 			return written, trace.Wrap(err)
@@ -248,6 +260,20 @@ func (c *flowConn) Write(b []byte) (int, error) {
 		b = b[len(chunk):]
 	}
 	return written, nil
+}
+
+// writeContext returns the context for one WebSocket write: the conn's
+// context, bounded by deadline if it is set.
+func (c *flowConn) writeContext(deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return c.ctx, func() {}
+	}
+	return context.WithDeadline(c.ctx, deadline)
+}
+
+// deadlinePassed reports whether deadline is set and has passed.
+func deadlinePassed(deadline time.Time) bool {
+	return !deadline.IsZero() && !time.Now().Before(deadline)
 }
 
 // wait waits on cond, waking up at deadline if it is set. c.mu must be
@@ -307,7 +333,7 @@ func (c *flowConn) SetDeadline(t time.Time) error {
 // a timeout error when it passes.
 func (c *flowConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
-	c.rdl = t
+	c.readDeadline = t
 	c.cond.Broadcast()
 	c.mu.Unlock()
 	return nil
@@ -317,7 +343,7 @@ func (c *flowConn) SetReadDeadline(t time.Time) error {
 // returns a timeout error when it passes.
 func (c *flowConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
-	c.wdl = t
+	c.writeDeadline = t
 	c.cond.Broadcast()
 	c.mu.Unlock()
 	return nil
