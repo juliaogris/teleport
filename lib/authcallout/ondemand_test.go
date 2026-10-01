@@ -141,17 +141,14 @@ func sendDial(t *testing.T, ws *websocket.Conn, kind, id string) {
 	require.NoError(t, ws.Write(t.Context(), websocket.MessageText, []byte("dial "+kind+" "+id)))
 }
 
-// requireClosed reads ws until it fails, within 5 s.
-func requireClosed(t *testing.T, ws *websocket.Conn) {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		readUntilClosed(t, ws)
-	}()
+// requireClosed reads ws until it fails, within 5 s, and returns the error.
+func requireClosed(t *testing.T, ws *websocket.Conn) error {
 	select {
-	case <-done:
+	case err := <-awaitClose(t, ws):
+		return err
 	case <-time.After(5 * time.Second):
 		t.Fatal("control socket still open after 5s")
+		return nil
 	}
 }
 
@@ -327,7 +324,8 @@ func TestOnDemandBadMessageClosesControl(t *testing.T) {
 			ctl := e.control(t)
 
 			require.NoError(t, ctl.Write(t.Context(), websocket.MessageText, []byte(msg)))
-			requireClosed(t, ctl)
+			err := requireClosed(t, ctl)
+			require.Equal(t, websocket.StatusPolicyViolation, websocket.CloseStatus(err))
 			e.noStream(t, 200*time.Millisecond)
 			// The callout redials.
 			e.control(t)

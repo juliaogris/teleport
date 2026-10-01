@@ -211,26 +211,44 @@ func (p *Pool) serveControl(log *slog.Logger) error {
 		pingErr <- p.ping(ctx, ws, &lastPong)
 		cancel()
 	}()
-	// The read below is not bound to ctx. A read that ends with its
-	// context drops the connection with no close frame, so a stop ends it
-	// through the close handshake instead.
+	// The read in serveDials is not bound to a context. A read that ends
+	// with its context drops the connection with no close frame, so a stop
+	// ends it through the close handshake instead.
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		closeGracefully(ws, websocket.StatusGoingAway)
+		select {
+		case <-p.dialCtx.Done():
+			closeGracefully(ws, websocket.StatusGoingAway)
+		case <-done:
+		}
 	}()
 
+	code, err := p.serveDials(ctx, ws, log, &lastPong, refuses)
+	if code != 0 {
+		closeGracefully(ws, code)
+		return trace.Wrap(err)
+	}
+	select {
+	case errPing := <-pingErr:
+		return trace.Wrap(errPing)
+	default:
+	}
+	return trace.Wrap(err)
+}
+
+// serveDials answers the proxy's dial requests on ws until the socket fails
+// or the proxy breaks the protocol. It returns the close status to send,
+// 1008 for a message the proxy must not send and 1011 for a failed write,
+// or 0 when the socket already failed.
+func (p *Pool) serveDials(ctx context.Context, ws *websocket.Conn, log *slog.Logger, lastPong *atomic.Int64, refuses bool) (websocket.StatusCode, error) {
 	for {
 		typ, msg, err := ws.Read(context.Background())
 		if err != nil {
-			select {
-			case errPing := <-pingErr:
-				return trace.Wrap(errPing)
-			default:
-			}
-			return trace.Wrap(err, "reading control socket")
+			return 0, trace.Wrap(err, "reading control socket")
 		}
 		if typ != websocket.MessageText {
-			return trace.BadParameter("control message is not text")
+			return websocket.StatusPolicyViolation, trace.BadParameter("control message is not text")
 		}
 		text := string(msg)
 		if text == "pong" {
@@ -239,13 +257,13 @@ func (p *Pool) serveControl(log *slog.Logger) error {
 		}
 		kind, id, err := parseDial(text)
 		if err != nil {
-			return trace.Wrap(err)
+			return websocket.StatusPolicyViolation, trace.Wrap(err)
 		}
 		if p.dialStream(log, kind, id) || !refuses {
 			continue
 		}
 		if err := writeControl(ctx, ws, "refuse "+id); err != nil {
-			return trace.Wrap(err, "writing refuse")
+			return websocket.StatusInternalError, trace.Wrap(err, "writing refuse")
 		}
 	}
 }
