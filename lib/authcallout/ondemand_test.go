@@ -17,11 +17,13 @@
 package authcallout
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +34,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 )
 
 // lazyStream is a stream socket the fake edge accepted.
@@ -393,6 +396,17 @@ func TestNextControlBackoff(t *testing.T) {
 			require.Equal(t, tc.want, got)
 		})
 	}
+}
+
+func TestWarnSometimes(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	s := rate.Sometimes{Interval: time.Minute}
+	for range 3 {
+		warnSometimes(t.Context(), log, &s, "control socket closed")
+	}
+	require.Equal(t, 1, strings.Count(buf.String(), "level=WARN"))
+	require.Equal(t, 2, strings.Count(buf.String(), "level=DEBUG"))
 }
 
 func TestOnDemandBacksOffAfterPolicyViolation(t *testing.T) {

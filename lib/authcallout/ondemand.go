@@ -140,7 +140,7 @@ func (p *Pool) runControl() {
 	var backoff time.Duration
 	for {
 		if !p.limiter.Allow() {
-			log.WarnContext(p.dialCtx, "auth callout: dial rate limit reached", "dials_per_minute", p.cfg.DialsPerMinute)
+			warnSometimes(p.dialCtx, log, &p.controlLogs.limited, "auth callout: dial rate limit reached", "dials_per_minute", p.cfg.DialsPerMinute)
 			if err := p.limiter.Wait(p.dialCtx); err != nil {
 				return
 			}
@@ -152,13 +152,37 @@ func (p *Pool) runControl() {
 		}
 		backoff = p.nextControlBackoff(backoff, time.Since(start), err)
 		wait := backoff/2 + mathrand.N(backoff/2)
-		log.WarnContext(p.dialCtx, "auth callout: control socket closed", "error", err, "retry_in", wait)
+		warnSometimes(p.dialCtx, log, &p.controlLogs.closed, "auth callout: control socket closed", "error", err, "retry_in", wait)
 		select {
 		case <-time.After(wait):
 		case <-p.dialCtx.Done():
 			return
 		}
 	}
+}
+
+// controlLogs rate limits the warnings of the control redial loop. A proxy
+// that evicts the socket with 1013 is redialed after Config.minBackoff
+// each time, and would otherwise warn twice a second for as long as it is
+// at its cap.
+type controlLogs struct {
+	limited, closed rate.Sometimes
+}
+
+// newControlLogs returns controlLogs that warn at most once a minute per
+// line.
+func newControlLogs() controlLogs {
+	return controlLogs{
+		limited: rate.Sometimes{Interval: time.Minute},
+		closed:  rate.Sometimes{Interval: time.Minute},
+	}
+}
+
+// warnSometimes logs msg at WARN when s allows it, and at DEBUG otherwise.
+func warnSometimes(ctx context.Context, log *slog.Logger, s *rate.Sometimes, msg string, args ...any) {
+	level := slog.LevelDebug
+	s.Do(func() { level = slog.LevelWarn })
+	log.Log(ctx, level, msg, args...)
 }
 
 // nextControlBackoff returns the backoff before the next control dial,

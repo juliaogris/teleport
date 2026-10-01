@@ -274,6 +274,7 @@ type Pool struct {
 	openStreams    atomic.Int32
 	appHandler     atomic.Pointer[func(net.Conn)]
 	dropLogs       dropLogs
+	controlLogs    controlLogs
 }
 
 // New returns a pool that does not dial until [Pool.Start].
@@ -295,6 +296,7 @@ func New(cfg Config) (*Pool, error) {
 
 		streamLimiters: newStreamLimiters(),
 		dropLogs:       newDropLogs(),
+		controlLogs:    newControlLogs(),
 	}, nil
 }
 
