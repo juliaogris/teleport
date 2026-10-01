@@ -18,6 +18,7 @@ package authcallout
 
 import (
 	"context"
+	"io"
 	"net"
 	"strconv"
 	"testing"
@@ -101,6 +102,17 @@ func TestFlowConnReadsBinaryAndSkipsAcks(t *testing.T) {
 		got += n
 	}
 	require.Equal(t, "hello", string(buf))
+}
+
+func TestFlowConnReadsEOFWhenProxyCloses(t *testing.T) {
+	for _, status := range []websocket.StatusCode{websocket.StatusNormalClosure, websocket.StatusGoingAway} {
+		t.Run(status.String(), func(t *testing.T) {
+			edge, c := dialAppStream(t)
+			require.NoError(t, edge.Close(status, ""))
+			_, err := c.Read(make([]byte, 1))
+			require.ErrorIs(t, err, io.EOF)
+		})
+	}
 }
 
 func TestFlowConnBadAckCloses(t *testing.T) {

@@ -18,6 +18,7 @@ package authcallout
 
 import (
 	"context"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -128,7 +129,7 @@ func (c *flowConn) readLoop() {
 	for {
 		typ, msg, err := c.ws.Read(c.ctx)
 		if err != nil {
-			c.fail(err)
+			c.fail(readError(err))
 			return
 		}
 		if err := c.receive(typ, msg); err != nil {
@@ -136,6 +137,16 @@ func (c *flowConn) readLoop() {
 			return
 		}
 	}
+}
+
+// readError maps a close with status 1000 or 1001 to [io.EOF], which is
+// what the layers above expect from a peer that is done.
+func readError(err error) error {
+	switch websocket.CloseStatus(err) {
+	case websocket.StatusNormalClosure, websocket.StatusGoingAway:
+		return io.EOF
+	}
+	return err
 }
 
 // receive queues a binary message for Read or applies a text ack.
@@ -187,11 +198,11 @@ func (c *flowConn) Read(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for len(c.pending) == 0 {
-		if c.closed {
-			return 0, net.ErrClosed
-		}
 		if c.readErr != nil {
 			return 0, c.readErr
+		}
+		if c.closed {
+			return 0, net.ErrClosed
 		}
 		if deadlinePassed(c.readDeadline) {
 			return 0, timeoutError{}
