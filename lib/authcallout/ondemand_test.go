@@ -17,6 +17,7 @@
 package authcallout
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -48,12 +49,18 @@ type lazyEdge struct {
 	controls chan *websocket.Conn
 	streams  chan lazyStream
 	srv      *httptest.Server
+	// refuses advertises "refuse" on control sockets. Set it before the
+	// pool starts.
+	refuses bool
 }
 
 func newLazyEdge(t *testing.T, pub ed25519.PublicKey) *lazyEdge {
 	e := &lazyEdge{pub: pub, controls: make(chan *websocket.Conn, 16), streams: make(chan lazyStream, 64)}
 	ctx := t.Context()
 	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if e.refuses && r.URL.Query().Get("mode") == "control" {
+			w.Header().Set(ControlHeader, ControlRefuse)
+		}
 		ws, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -230,6 +237,61 @@ func TestOnDemandDialAppNoHandler(t *testing.T) {
 
 	sendDial(t, ctl, "app", newStreamID(t))
 	e.noStream(t, time.Second)
+	// An edge that did not advertise refuse hears nothing.
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	_, _, err := ctl.Read(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestOnDemandRefusesDroppedDial(t *testing.T) {
+	requireRefuse := func(t *testing.T, ctl *websocket.Conn, id string) {
+		typ, msg, err := ctl.Read(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, websocket.MessageText, typ)
+		require.Equal(t, "refuse "+id, string(msg))
+	}
+
+	t.Run("no app handler", func(t *testing.T) {
+		pub, priv := newKey(t)
+		e := newLazyEdge(t, pub)
+		e.refuses = true
+		newOnDemandPool(t, e.url(t), priv)
+		ctl := e.control(t)
+
+		id := newStreamID(t)
+		sendDial(t, ctl, "app", id)
+		requireRefuse(t, ctl, id)
+		e.noStream(t, 200*time.Millisecond)
+	})
+
+	t.Run("too many streams", func(t *testing.T) {
+		pub, priv := newKey(t)
+		e := newLazyEdge(t, pub)
+		e.refuses = true
+		p := newOnDemandPool(t, e.url(t), priv)
+		ctl := e.control(t)
+		p.openStreams.Store(maxStreams)
+
+		id := newStreamID(t)
+		sendDial(t, ctl, "auth", id)
+		requireRefuse(t, ctl, id)
+		e.noStream(t, 200*time.Millisecond)
+	})
+
+	t.Run("over the dial budget", func(t *testing.T) {
+		pub, priv := newKey(t)
+		e := newLazyEdge(t, pub)
+		e.refuses = true
+		p := newOnDemandPool(t, e.url(t), priv)
+		ctl := e.control(t)
+		p.streamLimiter.SetBurst(0)
+
+		id := newStreamID(t)
+		sendDial(t, ctl, "auth", id)
+		requireRefuse(t, ctl, id)
+		e.noStream(t, 200*time.Millisecond)
+	})
 }
 
 func TestOnDemandStreamIDHeader(t *testing.T) {

@@ -45,7 +45,11 @@
 //     answers the same challenge as above.
 //  2. The proxy sends text messages "dial auth <id>" or "dial app <id>",
 //     where <id> is 32 random bytes in unpadded base64url. Any other
-//     message closes the control socket.
+//     message closes the control socket. For a dial it opens no stream
+//     for, the pool answers "refuse <id>" if the proxy's response to the
+//     control request carried the header "Sallyport-Control: refuse".
+//     Without that header the pool answers nothing, and the proxy learns
+//     of the dropped dial from its own deadline.
 //  3. The pool sends the text "ping" every 30 seconds and closes the socket
 //     when no "pong" comes back within 10 seconds. A proxy can answer it
 //     without waking up.
@@ -237,11 +241,11 @@ type Pool struct {
 	start   sync.Once
 	wg      sync.WaitGroup
 
-	// The fields below are used in on-demand mode only.
+	// These fields are used in on-demand mode only.
 	streamLimiter *rate.Limiter
 	openStreams   atomic.Int32
 	appHandler    atomic.Pointer[func(net.Conn)]
-	dropLog       rate.Sometimes
+	dropLogs      dropLogs
 }
 
 // New returns a pool that does not dial until [Pool.Start].
@@ -262,7 +266,7 @@ func New(cfg Config) (*Pool, error) {
 		stop:    stop,
 
 		streamLimiter: newStreamLimiter(),
-		dropLog:       rate.Sometimes{Interval: time.Minute},
+		dropLogs:      newDropLogs(),
 	}, nil
 }
 

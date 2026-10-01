@@ -23,6 +23,7 @@ import (
 	mathrand "math/rand/v2"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -53,8 +54,17 @@ const (
 	// StreamAcks says the pool acknowledges the bytes it receives on the
 	// stream, so the proxy can apply a window to them.
 	StreamAcks = "ack"
+	// ControlHeader on the proxy's response to a control request carries
+	// the control messages the proxy accepts. Its one value is
+	// [ControlRefuse].
+	ControlHeader = "Sallyport-Control"
+	// ControlRefuse says the proxy accepts "refuse <id>" for a dial the
+	// pool opens no stream for.
+	ControlRefuse = "refuse"
 	// controlReadLimit is larger than any control message.
 	controlReadLimit = 256
+	// controlWriteTimeout bounds each write on the control socket.
+	controlWriteTimeout = 10 * time.Second
 	// streamIDSize is the size of a stream id before base64url encoding.
 	streamIDSize = 32
 	// Stream dials in on-demand mode have their own budget: a page load
@@ -156,20 +166,21 @@ func (p *Pool) runControl() {
 // serveControl dials the control socket, answers the challenge, and serves
 // the proxy's dial requests until the socket closes.
 func (p *Pool) serveControl(log *slog.Logger) error {
-	ctx, cancel := context.WithTimeout(p.dialCtx, p.cfg.DialTimeout)
-	ws, _, err := websocket.Dial(ctx, p.modeURL("control"), &websocket.DialOptions{HTTPClient: noRedirectClient})
-	cancel()
+	dialCtx, cancelDial := context.WithTimeout(p.dialCtx, p.cfg.DialTimeout)
+	ws, resp, err := websocket.Dial(dialCtx, p.modeURL("control"), &websocket.DialOptions{HTTPClient: noRedirectClient})
+	cancelDial()
 	if err != nil {
 		return trace.Wrap(err, "dialing control socket")
 	}
 	defer ws.CloseNow()
+	refuses := slices.Contains(strings.Fields(resp.Header.Get(ControlHeader)), ControlRefuse)
 	ws.SetReadLimit(controlReadLimit)
 	if err := p.answerChallenge(ws); err != nil {
 		return trace.Wrap(err, "control challenge")
 	}
-	log.DebugContext(p.dialCtx, "auth callout: control socket ready")
+	log.DebugContext(p.dialCtx, "auth callout: control socket ready", "refuses", refuses)
 
-	ctx, cancel = context.WithCancel(p.dialCtx)
+	ctx, cancel := context.WithCancel(p.dialCtx)
 	defer cancel()
 	var lastPong atomic.Int64
 	lastPong.Store(time.Now().UnixNano())
@@ -183,8 +194,8 @@ func (p *Pool) serveControl(log *slog.Logger) error {
 		typ, msg, err := ws.Read(ctx)
 		if err != nil {
 			select {
-			case perr := <-pingErr:
-				return trace.Wrap(perr)
+			case errPing := <-pingErr:
+				return trace.Wrap(errPing)
 			default:
 			}
 			return trace.Wrap(err, "reading control socket")
@@ -201,12 +212,25 @@ func (p *Pool) serveControl(log *slog.Logger) error {
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		p.dialStream(log, kind, id)
+		if p.dialStream(log, kind, id) || !refuses {
+			continue
+		}
+		if err := writeControl(ctx, ws, "refuse "+id); err != nil {
+			return trace.Wrap(err, "writing refuse")
+		}
 	}
 }
 
-// ping writes "ping" every [pingEvery] and returns an error when a "pong"
-// is overdue.
+// writeControl writes one text message on the control socket within
+// [controlWriteTimeout].
+func writeControl(ctx context.Context, ws *websocket.Conn, text string) error {
+	ctx, cancel := context.WithTimeout(ctx, controlWriteTimeout)
+	defer cancel()
+	return trace.Wrap(ws.Write(ctx, websocket.MessageText, []byte(text)))
+}
+
+// ping writes "ping" every Config.pingEvery and returns an error when a
+// "pong" is more than Config.pongTimeout overdue.
 func (p *Pool) ping(ctx context.Context, ws *websocket.Conn, lastPong *atomic.Int64) error {
 	t := time.NewTicker(p.cfg.pingEvery)
 	defer t.Stop()
@@ -217,10 +241,7 @@ func (p *Pool) ping(ctx context.Context, ws *websocket.Conn, lastPong *atomic.In
 		case <-t.C:
 		}
 		sent := time.Now()
-		wctx, cancel := context.WithTimeout(ctx, p.cfg.pongTimeout)
-		err := ws.Write(wctx, websocket.MessageText, []byte("ping"))
-		cancel()
-		if err != nil {
+		if err := writeControl(ctx, ws, "ping"); err != nil {
 			return trace.Wrap(err, "writing ping")
 		}
 		select {
@@ -254,31 +275,32 @@ func parseDial(text string) (streamKind, string, error) {
 	return kind, id, nil
 }
 
-// dialStream opens the stream the proxy asked for, unless the stream dial
-// budget is used up or no app handler is set for an app stream.
-func (p *Pool) dialStream(log *slog.Logger, kind streamKind, id string) {
+// dialStream opens the stream the proxy asked for and reports whether it
+// did. It opens none when no app handler is set for an app stream, when
+// [maxStreams] are open, or when the stream dial budget is used up.
+func (p *Pool) dialStream(log *slog.Logger, kind streamKind, id string) bool {
 	var handler func(net.Conn)
 	if kind == streamApp {
 		h := p.appHandler.Load()
 		if h == nil {
-			p.dropLog.Do(func() {
+			p.dropLogs.noHandler.Do(func() {
 				log.WarnContext(p.dialCtx, "auth callout: app stream asked for, but no app service is registered")
 			})
-			return
+			return false
 		}
 		handler = *h
 	}
 	if p.openStreams.Load() >= maxStreams {
-		p.dropLog.Do(func() {
+		p.dropLogs.tooMany.Do(func() {
 			log.WarnContext(p.dialCtx, "auth callout: too many streams open, dropping dials", "max_streams", maxStreams)
 		})
-		return
+		return false
 	}
 	if !p.streamLimiter.Allow() {
-		p.dropLog.Do(func() {
+		p.dropLogs.overBudget.Do(func() {
 			log.WarnContext(p.dialCtx, "auth callout: stream dial rate limit reached, dropping dials", "dials_per_minute", streamDialsPerMinute)
 		})
-		return
+		return false
 	}
 	p.wg.Add(1)
 	p.openStreams.Add(1)
@@ -289,6 +311,22 @@ func (p *Pool) dialStream(log *slog.Logger, kind streamKind, id string) {
 			log.DebugContext(p.dialCtx, "auth callout: stream failed", "kind", kind, "error", err)
 		}
 	}()
+	return true
+}
+
+// dropLogs rate limits the log line for each reason a dial is dropped, so
+// that one reason cannot silence another.
+type dropLogs struct {
+	noHandler, tooMany, overBudget rate.Sometimes
+}
+
+// newDropLogs returns dropLogs that log each reason at most once a minute.
+func newDropLogs() dropLogs {
+	return dropLogs{
+		noHandler:  rate.Sometimes{Interval: time.Minute},
+		tooMany:    rate.Sometimes{Interval: time.Minute},
+		overBudget: rate.Sometimes{Interval: time.Minute},
+	}
 }
 
 // serveStream opens one stream and hands it to auth's listener or to the
