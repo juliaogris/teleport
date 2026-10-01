@@ -195,17 +195,25 @@ func (c *flowConn) receive(typ websocket.MessageType, msg []byte) error {
 	return nil
 }
 
-// fail records err as the error of every later Read and closes the conn
-// with code.
+// fail records err as the error of every later Read, unless a close already
+// set one, and closes the conn with code.
 //
 // A WebSocket that cannot be read carries no more acks, so a writer would
 // otherwise wait for good.
 func (c *flowConn) fail(err error, code websocket.StatusCode) {
-	c.mu.Lock()
-	c.readErr = err
-	c.cond.Broadcast()
-	c.mu.Unlock()
+	c.setReadErr(err)
 	c.closeWith(code)
+}
+
+// setReadErr sets the error of every later Read, once pending bytes are
+// drained. The first cause wins, so a later one does not replace it.
+func (c *flowConn) setReadErr(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.readErr == nil {
+		c.readErr = err
+	}
+	c.cond.Broadcast()
 }
 
 // parseAck parses "ack <n>".
@@ -236,9 +244,6 @@ func (c *flowConn) take(b []byte) (int, error) {
 	for len(c.pending) == 0 {
 		if c.readErr != nil {
 			return 0, c.readErr
-		}
-		if c.closed {
-			return 0, net.ErrClosed
 		}
 		if deadlinePassed(c.readDeadline) {
 			return 0, timeoutError{}
@@ -368,13 +373,14 @@ func (c *flowConn) Close() error {
 }
 
 // closeWith closes the WebSocket with code, once. Later calls with any
-// code do nothing.
+// code do nothing. A Read after a close the conn started returns
+// [net.ErrClosed], whatever the proxy echoes back.
 func (c *flowConn) closeWith(code websocket.StatusCode) {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closed = true
-		c.cond.Broadcast()
 		c.mu.Unlock()
+		c.setReadErr(net.ErrClosed)
 		closeGracefully(c.ws, code)
 		c.cancel()
 		close(c.done)
