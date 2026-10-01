@@ -7159,37 +7159,36 @@ func (process *TeleportProcess) initApps() {
 			return trace.Wrap(err)
 		}
 
+		// Create and start an agent pool, unless the apps are served
+		// through the auth callout.
+		var agentPool *reversetunnel.AgentPool
 		if serveThroughCallout {
 			if err := process.authCallout.SetAppHandler(appServer.HandleConnection); err != nil {
 				return trace.Wrap(err)
 			}
 			logger.InfoContext(process.ExitContext(), "Serving apps through the auth callout, without a reverse tunnel.")
-			process.BroadcastEvent(Event{Name: AppsReady, Payload: nil})
-			return nil
-		}
-
-		// Create and start an agent pool.
-		agentPool, err := reversetunnel.NewAgentPool(
-			process.ExitContext(),
-			reversetunnel.AgentPoolConfig{
-				Component:                teleport.ComponentApp,
-				HostUUID:                 conn.HostID(),
-				Resolver:                 tunnelAddrResolver,
-				Client:                   conn.Client,
-				Server:                   appServer,
-				AccessPoint:              accessPoint,
-				AuthMethods:              conn.ClientAuthMethods(),
-				Cluster:                  clusterName,
-				FIPS:                     process.Config.FIPS,
-				ConnectedProxyGetter:     proxyGetter,
-				StaleConnTimeoutDisabled: reversetunnel.IsAgentStaleConnTimeoutDisabledByEnv(),
-			})
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		err = agentPool.Start()
-		if err != nil {
-			return trace.Wrap(err)
+		} else {
+			agentPool, err = reversetunnel.NewAgentPool(
+				process.ExitContext(),
+				reversetunnel.AgentPoolConfig{
+					Component:                teleport.ComponentApp,
+					HostUUID:                 conn.HostID(),
+					Resolver:                 tunnelAddrResolver,
+					Client:                   conn.Client,
+					Server:                   appServer,
+					AccessPoint:              accessPoint,
+					AuthMethods:              conn.ClientAuthMethods(),
+					Cluster:                  clusterName,
+					FIPS:                     process.Config.FIPS,
+					ConnectedProxyGetter:     proxyGetter,
+					StaleConnTimeoutDisabled: reversetunnel.IsAgentStaleConnTimeoutDisabledByEnv(),
+				})
+			if err != nil {
+				return trace.Wrap(err)
+			}
+			if err := agentPool.Start(); err != nil {
+				return trace.Wrap(err)
+			}
 		}
 
 		process.BroadcastEvent(Event{Name: AppsReady, Payload: nil})
@@ -7211,7 +7210,9 @@ func (process *TeleportProcess) initApps() {
 			if asyncEmitter != nil {
 				warnOnErr(process.ExitContext(), asyncEmitter.Close(), logger)
 			}
-			agentPool.Stop()
+			if agentPool != nil {
+				agentPool.Stop()
+			}
 			warnOnErr(process.ExitContext(), asyncEmitter.Close(), logger)
 			warnOnErr(process.ExitContext(), conn.Close(), logger)
 			logger.InfoContext(process.ExitContext(), "Exited.")
@@ -7221,7 +7222,9 @@ func (process *TeleportProcess) initApps() {
 		if err := appServer.Wait(); err != nil && !errors.Is(err, context.Canceled) {
 			return trace.Wrap(err)
 		}
-		agentPool.Wait()
+		if agentPool != nil {
+			agentPool.Wait()
+		}
 		return nil
 	})
 }

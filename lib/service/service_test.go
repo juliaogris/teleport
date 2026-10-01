@@ -3093,4 +3093,15 @@ func TestAuthCalloutOnDemandServesAuthAndApps(t *testing.T) {
 
 	_, err = readAfterHandshake(dial("app"))
 	require.ErrorContains(t, err, "certificate required", "an app stream must reach the app server")
+
+	// The app service keeps running and heartbeating its app after start.
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		servers, err := process.GetAuthServer().GetApplicationServers(ctx, apidefaults.Namespace)
+		require.NoError(c, err)
+		var names []string
+		for _, s := range servers {
+			names = append(names, s.GetApp().GetName())
+		}
+		require.Contains(c, names, "bench")
+	}, 30*time.Second, 500*time.Millisecond, "the app service stopped heartbeating its app")
 }
