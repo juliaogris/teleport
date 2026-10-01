@@ -28,6 +28,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/coder/websocket"
 	"github.com/gravitational/trace"
@@ -219,7 +220,7 @@ func (p *Pool) serveControl(log *slog.Logger) error {
 		return trace.Wrap(err, "dialing control socket")
 	}
 	defer ws.CloseNow()
-	refuses := slices.Contains(strings.Fields(resp.Header.Get(ControlHeader)), ControlRefuse)
+	refuses := headerLists(resp.Header.Values(ControlHeader), ControlRefuse)
 	ws.SetReadLimit(controlReadLimit)
 	if err := p.answerChallenge(ws); err != nil {
 		return trace.Wrap(err, "control challenge")
@@ -291,6 +292,23 @@ func (p *Pool) serveDials(ctx context.Context, ws *websocket.Conn, log *slog.Log
 			return websocket.StatusInternalError, trace.Wrap(err, "writing refuse")
 		}
 	}
+}
+
+// headerLists returns true when one of a header's values lists want. A
+// value is a list of tokens separated by commas or spaces, so "refuse",
+// "refuse, fail" and "fail refuse" all list "refuse".
+func headerLists(values []string, want string) bool {
+	for _, value := range values {
+		if slices.Contains(strings.FieldsFunc(value, isListSeparator), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// isListSeparator returns true for a comma or a space in a header value.
+func isListSeparator(r rune) bool {
+	return r == ',' || unicode.IsSpace(r)
 }
 
 // writeControl writes one text message on the control socket within

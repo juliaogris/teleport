@@ -323,6 +323,25 @@ func TestOnDemandRefusesDroppedDial(t *testing.T) {
 	})
 }
 
+func TestHeaderLists(t *testing.T) {
+	for _, tc := range []struct {
+		values []string
+		want   bool
+	}{
+		{values: []string{"refuse"}, want: true},
+		{values: []string{"refuse, fail"}, want: true},
+		{values: []string{"fail refuse"}, want: true},
+		{values: []string{"fail", "refuse"}, want: true},
+		{values: nil, want: false},
+		{values: []string{""}, want: false},
+		{values: []string{"refusal"}, want: false},
+	} {
+		t.Run(strings.Join(tc.values, "|"), func(t *testing.T) {
+			require.Equal(t, tc.want, headerLists(tc.values, ControlRefuse))
+		})
+	}
+}
+
 func TestOnDemandBadMessageClosesControl(t *testing.T) {
 	for _, msg := range []string{
 		"hello",
