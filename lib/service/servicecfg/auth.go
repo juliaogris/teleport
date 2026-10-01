@@ -55,6 +55,10 @@ type AuthConfig struct {
 	// challenge.
 	CalloutKeyFile string
 
+	// CalloutMode is how the callout opens streams: CalloutModePool (the
+	// default) or CalloutModeOnDemand.
+	CalloutMode string
+
 	// Authorities is a set of trusted certificate authorities
 	// that will be added by this auth server on the first start
 	Authorities []types.CertAuthority
@@ -362,3 +366,12 @@ type KeystoreActiveHealthCheck struct {
 	// Enabled enables active health checking.
 	Enabled bool `yaml:"enabled"`
 }
+
+const (
+	// CalloutModePool keeps a fixed number of callout streams open.
+	CalloutModePool = "pool"
+	// CalloutModeOnDemand keeps one control socket open and opens a stream
+	// when the proxy asks for one. An app service in the same process then
+	// serves apps through the callout instead of a reverse tunnel.
+	CalloutModeOnDemand = "on_demand"
+)

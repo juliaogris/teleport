@@ -819,6 +819,13 @@ type Auth struct {
 	// form, that signs the callout challenge. It is required with CalloutTo.
 	CalloutKeyFile string `yaml:"callout_key_file,omitempty"`
 
+	// CalloutMode is how the callout opens streams: "pool" (the default)
+	// keeps a fixed number open, and "on_demand" keeps one control socket
+	// open and opens a stream when the proxy asks for one. With
+	// "on_demand", an app service in the same process serves apps through
+	// the callout instead of a reverse tunnel. It requires CalloutTo.
+	CalloutMode string `yaml:"callout_mode,omitempty"`
+
 	// ClusterName is the name of the CA who manages this cluster
 	ClusterName ClusterName `yaml:"cluster_name,omitempty"`
 

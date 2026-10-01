@@ -774,6 +774,10 @@ type TeleportProcess struct {
 
 	tsrv            reversetunnelclient.Server
 	immutableLabels *joiningv1.ImmutableLabels
+
+	// authCallout is the auth service's callout, if it has one. It is set
+	// by initAuthService, before the other services start.
+	authCallout *authcallout.Pool
 }
 
 // processIndex is an internal process index
@@ -2821,12 +2825,17 @@ func (process *TeleportProcess) initAuthService() error {
 			listener.Close()
 			return trace.Wrap(err, "loading auth_service.callout_key_file")
 		}
-		calloutPool, err = authcallout.New(authcallout.Config{URL: cfg.Auth.CalloutTo, Key: key, Logger: logger})
+		mode := authcallout.ModePool
+		if cfg.Auth.CalloutMode == servicecfg.CalloutModeOnDemand {
+			mode = authcallout.ModeOnDemand
+		}
+		calloutPool, err = authcallout.New(authcallout.Config{URL: cfg.Auth.CalloutTo, Key: key, Logger: logger, Mode: mode})
 		if err != nil {
 			listener.Close()
 			return trace.Wrap(err)
 		}
 		listener = authcallout.NewListener(listener, calloutPool)
+		process.authCallout = calloutPool
 	}
 
 	muxCAGetter := func(ctx context.Context, id types.CertAuthID, loadKeys bool) (types.CertAuthority, error) {
@@ -6909,8 +6918,12 @@ func (process *TeleportProcess) initApps() {
 		// If it was not, it is running in single process mode which is used for
 		// development and demos. In that case, wait until all dependencies (like
 		// auth and reverse tunnel server) are ready before starting.
+		// With an on-demand auth callout in this process, the proxy opens
+		// app connections through the callout. There is no reverse tunnel,
+		// so the app service needs no proxy and does not wait for one.
+		serveThroughCallout := process.authCallout != nil && process.authCallout.Mode() == authcallout.ModeOnDemand
 		tunnelAddrResolver := conn.TunnelProxyResolver()
-		if tunnelAddrResolver == nil {
+		if tunnelAddrResolver == nil && !serveThroughCallout {
 			tunnelAddrResolver = process.SingleProcessModeResolver(resp.GetProxyListenerMode())
 
 			// run the resolver. this will check configuration for errors.
@@ -7144,6 +7157,15 @@ func (process *TeleportProcess) initApps() {
 		// and (dynamic) label update.
 		if err := appServer.Start(process.ExitContext()); err != nil {
 			return trace.Wrap(err)
+		}
+
+		if serveThroughCallout {
+			if err := process.authCallout.SetAppHandler(appServer.HandleConnection); err != nil {
+				return trace.Wrap(err)
+			}
+			logger.InfoContext(process.ExitContext(), "Serving apps through the auth callout, without a reverse tunnel.")
+			process.BroadcastEvent(Event{Name: AppsReady, Payload: nil})
+			return nil
 		}
 
 		// Create and start an agent pool.

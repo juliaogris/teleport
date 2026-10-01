@@ -24,6 +24,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -2966,4 +2967,130 @@ func TestAuthCalloutServesTLSAndStopsOnShutdown(t *testing.T) {
 	defer cancelRead()
 	_, _, err = idle.Read(readCtx)
 	require.Error(t, err, "Shutdown left an idle callout WebSocket open")
+}
+
+// onDemandEdge is the edge side of an on-demand auth callout. It verifies
+// control sockets against pub and hands them to controls, and hands
+// stream sockets to streams.
+func onDemandEdge(t *testing.T, pub ed25519.PublicKey, controls, streams chan<- *websocket.Conn) *url.URL {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		if r.URL.Query().Get("mode") == "stream" {
+			streams <- ws
+			return
+		}
+		ctx := context.Background()
+		nonce := make([]byte, authcallout.NonceSize)
+		rand.Read(nonce)
+		if err := ws.Write(ctx, websocket.MessageBinary, nonce); err != nil {
+			ws.CloseNow()
+			return
+		}
+		_, reply, err := ws.Read(ctx)
+		if err != nil || len(reply) != authcallout.NonceSize+ed25519.SignatureSize {
+			ws.CloseNow()
+			return
+		}
+		msg := authcallout.SignedMessage(r.Host, nonce, reply[:authcallout.NonceSize])
+		if !ed25519.Verify(pub, msg, reply[authcallout.NonceSize:]) {
+			ws.CloseNow()
+			return
+		}
+		controls <- ws
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse("ws" + strings.TrimPrefix(srv.URL, "http") + "/tunnel/auth")
+	require.NoError(t, err)
+	return u
+}
+
+func TestAuthCalloutOnDemandServesAuthAndApps(t *testing.T) {
+	t.Parallel()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(priv)
+	require.NoError(t, err)
+	keyPath := filepath.Join(t.TempDir(), "callout.pem")
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})
+	require.NoError(t, os.WriteFile(keyPath, keyPEM, 0o600))
+	controls := make(chan *websocket.Conn, 4)
+	streams := make(chan *websocket.Conn, 4)
+
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(app.Close)
+
+	dataDir := makeTempDir(t)
+	cfg := servicecfg.MakeDefaultConfig()
+	cfg.DataDir = dataDir
+	cfg.SetAuthServerAddress(utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"})
+	cfg.Auth.Enabled = true
+	cfg.Proxy.Enabled = false
+	cfg.SSH.Enabled = false
+	cfg.DebugService.Enabled = false
+	cfg.Auth.StorageConfig.Params["path"] = dataDir
+	cfg.Auth.ListenAddr = utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"}
+	cfg.Auth.CalloutTo = onDemandEdge(t, pub, controls, streams)
+	cfg.Auth.CalloutKeyFile = keyPath
+	cfg.Auth.CalloutMode = servicecfg.CalloutModeOnDemand
+	cfg.Apps.Enabled = true
+	cfg.Apps.Apps = []servicecfg.App{{Name: "bench", URI: app.URL, PublicAddr: "bench.example.com"}}
+	cfg.CircuitBreakerConfig = breaker.NoopBreakerConfig()
+
+	process, err := NewTeleport(cfg)
+	require.NoError(t, err)
+	require.NoError(t, process.Start())
+	t.Cleanup(func() {
+		process.Close()
+		process.Wait()
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	_, err = process.WaitForEvent(ctx, AppsReady)
+	require.NoError(t, err, "the app service did not start without a proxy")
+
+	next := func(c chan *websocket.Conn, what string) *websocket.Conn {
+		select {
+		case ws := <-c:
+			t.Cleanup(func() { ws.CloseNow() })
+			return ws
+		case <-ctx.Done():
+			t.Fatalf("no %s within 60s", what)
+			return nil
+		}
+	}
+	control := next(controls, "control socket")
+	dial := func(kind string) *websocket.Conn {
+		id := make([]byte, 32)
+		rand.Read(id)
+		msg := "dial " + kind + " " + base64.RawURLEncoding.EncodeToString(id)
+		require.NoError(t, control.Write(ctx, websocket.MessageText, []byte(msg)))
+		return next(streams, kind+" stream")
+	}
+	// readAfterHandshake does a TLS 1.3 handshake with no client cert over
+	// ws, then reads for up to 2 s. The app server requires a client cert
+	// and sends an alert. Auth only verifies one if given, so the read
+	// times out.
+	readAfterHandshake := func(ws *websocket.Conn) (*x509.Certificate, error) {
+		tlsConn := tls.Client(websocket.NetConn(ctx, ws, websocket.MessageBinary), &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS13,
+			ServerName:         "teleport.cluster.local",
+		})
+		require.NoError(t, tlsConn.HandshakeContext(ctx))
+		require.NoError(t, tlsConn.SetReadDeadline(time.Now().Add(2*time.Second)))
+		_, err := tlsConn.Read(make([]byte, 1))
+		return tlsConn.ConnectionState().PeerCertificates[0], err
+	}
+
+	leaf, err := readAfterHandshake(dial("auth"))
+	require.Contains(t, leaf.DNSNames, "teleport.cluster.local")
+	// websocket.NetConn reports the passed deadline as a cancelled context.
+	require.ErrorIs(t, err, context.Canceled, "an auth stream must reach the auth TLS server")
+
+	_, err = readAfterHandshake(dial("app"))
+	require.ErrorContains(t, err, "certificate required", "an app stream must reach the app server")
 }

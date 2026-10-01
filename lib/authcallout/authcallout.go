@@ -37,6 +37,30 @@
 // The pool never offers WebSocket compression and rejects a proxy that
 // switches it on. Every message is read through a size limit that counts
 // the bytes after any inflation.
+//
+// In [ModeOnDemand] the pool keeps one control socket open instead of the
+// streams, so that a proxy on an edge that bills idle time can sleep:
+//
+//  1. The pool dials the URL with the query parameter mode=control and
+//     answers the same challenge as above.
+//  2. The proxy sends text messages "dial auth <id>" or "dial app <id>",
+//     where <id> is 32 random bytes in unpadded base64url. Any other
+//     message closes the control socket.
+//  3. The pool sends the text "ping" every 30 seconds and closes the socket
+//     when no "pong" comes back within 10 seconds. A proxy can answer it
+//     without waking up.
+//  4. For each dial, the pool dials the URL with mode=stream and the id in
+//     the Sallyport-Stream-Id header. There is no challenge on a stream:
+//     the proxy accepts only an id it sent on the control socket, once.
+//     An auth stream goes to [Pool.Accept]. An app stream goes to the
+//     handler set with [Pool.SetAppHandler].
+//
+// An app stream is TLS from the proxy to the app service, as a reverse
+// tunnel connection would be. The pool authenticates the proxy only by the
+// TLS certificate of the URL's host. The reverse tunnel also checks the
+// proxy's host certificate against the cluster's host CA, so on this path
+// the app service's own check of the user's client certificate is the
+// only Teleport check.
 package authcallout
 
 import (

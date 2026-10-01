@@ -1100,6 +1100,60 @@ func TestApplyAuthCallout(t *testing.T) {
 	}
 }
 
+func TestApplyAuthCalloutMode(t *testing.T) {
+	const callout = "proxy_protocol: off\n  callout_to: wss://teleport.example.com/tunnel/auth\n  callout_key_file: /etc/teleport/callout.pem"
+	for _, tc := range []struct {
+		name     string
+		yaml     string
+		wantMode string
+		wantErr  string
+	}{
+		{
+			name:     "unset",
+			yaml:     callout,
+			wantMode: servicecfg.CalloutModePool,
+			wantErr:  "",
+		},
+		{
+			name:     "pool",
+			yaml:     callout + "\n  callout_mode: pool",
+			wantMode: servicecfg.CalloutModePool,
+			wantErr:  "",
+		},
+		{
+			name:     "on_demand",
+			yaml:     callout + "\n  callout_mode: on_demand",
+			wantMode: servicecfg.CalloutModeOnDemand,
+			wantErr:  "",
+		},
+		{
+			name:     "on_demand without callout_to",
+			yaml:     "callout_mode: on_demand",
+			wantMode: "",
+			wantErr:  "requires callout_to",
+		},
+		{
+			name:     "unknown",
+			yaml:     callout + "\n  callout_mode: lazy",
+			wantMode: "",
+			wantErr:  "callout_mode must be",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conf, err := ReadConfig(bytes.NewBufferString("auth_service:\n  enabled: true\n  " + tc.yaml + "\n"))
+			require.NoError(t, err)
+			cfg := servicecfg.MakeDefaultConfig()
+			err = ApplyFileConfig(conf, cfg)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantMode, cfg.Auth.CalloutMode)
+		})
+	}
+}
+
 // TestApplyCustomAuthPreference makes sure that if the auth file configuration
 // has a `cluster_auth_preference` field, then it will have the origin label as
 // config-file.

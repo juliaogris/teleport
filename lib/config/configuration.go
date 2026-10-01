@@ -936,6 +936,18 @@ func applyAuthConfig(fc *FileConfig, cfg *servicecfg.Config) error {
 		cfg.Auth.CalloutTo = u
 		cfg.Auth.CalloutKeyFile = fc.Auth.CalloutKeyFile
 	}
+	switch fc.Auth.CalloutMode {
+	case "", servicecfg.CalloutModePool:
+		cfg.Auth.CalloutMode = servicecfg.CalloutModePool
+	case servicecfg.CalloutModeOnDemand:
+		if fc.Auth.CalloutTo == "" {
+			return trace.BadParameter("auth_service.callout_mode: on_demand requires callout_to")
+		}
+		cfg.Auth.CalloutMode = servicecfg.CalloutModeOnDemand
+	default:
+		return trace.BadParameter("auth_service.callout_mode must be %q or %q, got %q",
+			servicecfg.CalloutModePool, servicecfg.CalloutModeOnDemand, fc.Auth.CalloutMode)
+	}
 
 	if fc.Auth.ListenAddress != "" {
 		addr, err := utils.ParseHostPortAddr(fc.Auth.ListenAddress, int(defaults.AuthListenPort))
