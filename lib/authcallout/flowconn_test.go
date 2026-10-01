@@ -17,6 +17,7 @@
 package authcallout
 
 import (
+	"context"
 	"net"
 	"strconv"
 	"testing"
@@ -123,4 +124,64 @@ func TestFlowConnReadDeadline(t *testing.T) {
 	// A write is not held by the read deadline.
 	_, err = c.Write([]byte("x"))
 	require.NoError(t, err)
+}
+
+// drain reads and drops what the callout sends, without acking, so a
+// writer blocks on the window and not on TCP.
+func drain(ws *websocket.Conn) {
+	go func() {
+		for {
+			if _, _, err := ws.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}()
+}
+
+func TestFlowConnWriteDeadlineWhileWindowFull(t *testing.T) {
+	edge, c := dialAppStream(t)
+	drain(edge)
+	_, err := c.Write(make([]byte, streamWindow))
+	require.NoError(t, err)
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(100*time.Millisecond)))
+	_, err = c.Write([]byte("x"))
+	var ne net.Error
+	require.ErrorAs(t, err, &ne)
+	require.True(t, ne.Timeout())
+}
+
+func TestFlowConnCloseUnblocksWrite(t *testing.T) {
+	edge, c := dialAppStream(t)
+	drain(edge)
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Write(make([]byte, 2*streamWindow))
+		done <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+	require.NoError(t, c.Close())
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, net.ErrClosed)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Write still blocked after Close")
+	}
+}
+
+func TestFlowConnTooMuchUnreadCloses(t *testing.T) {
+	edge, c := dialAppStream(t)
+	// The hub sends at most 64 KiB per message.
+	chunk := make([]byte, 64<<10)
+	for range maxPendingRead/len(chunk) + 1 {
+		if err := edge.Write(t.Context(), websocket.MessageBinary, chunk); err != nil {
+			break
+		}
+	}
+	// Nobody reads, so the bytes pile up past the limit.
+	fc := c.(*flowConn)
+	require.Eventually(t, func() bool {
+		fc.mu.Lock()
+		defer fc.mu.Unlock()
+		return fc.closed
+	}, 10*time.Second, 50*time.Millisecond, "the stream stayed open with more than maxPendingRead unread")
 }

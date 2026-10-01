@@ -233,6 +233,7 @@ type Pool struct {
 
 	// The fields below are used in on-demand mode only.
 	streamLimiter *rate.Limiter
+	openStreams   atomic.Int32
 	appHandler    atomic.Pointer[func(net.Conn)]
 	dropLog       rate.Sometimes
 }

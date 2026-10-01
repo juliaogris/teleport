@@ -943,6 +943,12 @@ func applyAuthConfig(fc *FileConfig, cfg *servicecfg.Config) error {
 		if fc.Auth.CalloutTo == "" {
 			return trace.BadParameter("auth_service.callout_mode: on_demand requires callout_to")
 		}
+		// In on-demand mode the app service serves through the callout and
+		// starts no reverse tunnel, so a proxy in the same process could
+		// never reach the apps.
+		if fc.Proxy.Enabled() {
+			return trace.BadParameter("auth_service.callout_mode: on_demand cannot be used with proxy_service in the same process")
+		}
 		cfg.Auth.CalloutMode = servicecfg.CalloutModeOnDemand
 	default:
 		return trace.BadParameter("auth_service.callout_mode must be %q or %q, got %q",

@@ -55,6 +55,12 @@ const (
 	// asks for many streams at once.
 	streamDialBurst      = 32
 	streamDialsPerMinute = 120
+	// maxStreams caps the streams open at once in on-demand mode.
+	maxStreams = 256
+	// maxControlBackoff is the longest wait before redialing a control
+	// socket that the proxy refused or that closed within shortControl.
+	maxControlBackoff = 10 * time.Minute
+	shortControl      = 10 * time.Second
 )
 
 const (
@@ -85,6 +91,9 @@ func (p *Pool) SetAppHandler(h func(net.Conn)) error {
 	p.appHandler.Store(&h)
 	return nil
 }
+
+// ClearAppHandler removes the app handler. Later app dials open no stream.
+func (p *Pool) ClearAppHandler() { p.appHandler.Store(nil) }
 
 // Mode returns the pool's mode.
 func (p *Pool) Mode() Mode { return p.cfg.Mode }
@@ -120,9 +129,16 @@ func (p *Pool) runControl() {
 		if time.Since(start) > maxBackoff {
 			backoff = 0
 		}
-		backoff = min(max(2*backoff, minBackoff), maxBackoff)
+		// Each dial wakes the proxy if it sleeps. A proxy that refuses the
+		// socket, or another auth process that keeps replacing it, would
+		// otherwise wake it every 30 seconds for good.
+		limit := maxBackoff
+		if websocket.CloseStatus(err) == websocket.StatusPolicyViolation || time.Since(start) < shortControl {
+			limit = maxControlBackoff
+		}
+		backoff = min(max(2*backoff, minBackoff), limit)
 		wait := backoff/2 + mathrand.N(backoff/2)
-		log.DebugContext(p.dialCtx, "auth callout: control socket closed", "error", err, "retry_in", wait)
+		log.WarnContext(p.dialCtx, "auth callout: control socket closed", "error", err, "retry_in", wait)
 		select {
 		case <-time.After(wait):
 		case <-p.dialCtx.Done():
@@ -246,6 +262,12 @@ func (p *Pool) dialStream(log *slog.Logger, kind streamKind, id string) {
 		}
 		handler = *h
 	}
+	if p.openStreams.Load() >= maxStreams {
+		p.dropLog.Do(func() {
+			log.WarnContext(p.dialCtx, "auth callout: too many streams open, dropping dials", "max_streams", maxStreams)
+		})
+		return
+	}
 	if !p.streamLimiter.Allow() {
 		p.dropLog.Do(func() {
 			log.WarnContext(p.dialCtx, "auth callout: stream dial rate limit reached, dropping dials", "dials_per_minute", streamDialsPerMinute)
@@ -253,8 +275,10 @@ func (p *Pool) dialStream(log *slog.Logger, kind streamKind, id string) {
 		return
 	}
 	p.wg.Add(1)
+	p.openStreams.Add(1)
 	go func() {
 		defer p.wg.Done()
+		defer p.openStreams.Add(-1)
 		if err := p.serveStream(kind, id, handler); err != nil {
 			log.DebugContext(p.dialCtx, "auth callout: stream failed", "kind", kind, "error", err)
 		}

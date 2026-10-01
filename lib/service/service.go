@@ -2890,6 +2890,14 @@ func (process *TeleportProcess) initAuthService() error {
 			if _, err := process.WaitForEvent(process.GracefulExitContext(), AuthTLSReady); err != nil {
 				return nil
 			}
+			// An app dial that arrives before the app service has set
+			// its handler would be dropped, so an on-demand callout with
+			// apps in this process also waits for the apps.
+			if calloutPool.Mode() == authcallout.ModeOnDemand && cfg.Apps.Enabled {
+				if _, err := process.WaitForEvent(process.GracefulExitContext(), AppsReady); err != nil {
+					return nil
+				}
+			}
 			logger.InfoContext(process.ExitContext(), "Starting auth callout.", "url", cfg.Auth.CalloutTo.Redacted())
 			calloutPool.Start()
 			<-process.GracefulExitContext().Done()
@@ -7212,6 +7220,9 @@ func (process *TeleportProcess) initApps() {
 			}
 			if agentPool != nil {
 				agentPool.Stop()
+			}
+			if serveThroughCallout {
+				process.authCallout.ClearAppHandler()
 			}
 			warnOnErr(process.ExitContext(), asyncEmitter.Close(), logger)
 			warnOnErr(process.ExitContext(), conn.Close(), logger)

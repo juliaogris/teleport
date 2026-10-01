@@ -39,6 +39,13 @@ const (
 	// maxPendingRead bounds the bytes from the proxy that wait for a
 	// reader. The proxy sends little on a stream: TLS records of requests.
 	maxPendingRead = 8 << 20
+	// streamIdle closes a stream that has carried no bytes either way for
+	// this long, so that a proxy that stops acking or never closes cannot
+	// keep a stream and its goroutines forever. The edge closes idle
+	// streams after 30 seconds.
+	streamIdle = 2 * time.Minute
+	// closeTimeout bounds the WebSocket close handshake.
+	closeTimeout = 5 * time.Second
 )
 
 // flowConn is a [net.Conn] over one on-demand stream. Binary messages carry
@@ -60,6 +67,9 @@ type flowConn struct {
 	// rdl and wdl are the read and write deadlines.
 	rdl, wdl time.Time
 
+	// active is when bytes last crossed in either direction.
+	active time.Time
+
 	writeMu   sync.Mutex
 	closeOnce sync.Once
 	done      chan struct{}
@@ -71,14 +81,37 @@ type flowConn struct {
 // conn.
 func newFlowConn(ctx context.Context, ws *websocket.Conn, local, remote net.Addr) *flowConn {
 	ctx, cancel := context.WithCancel(ctx)
-	c := &flowConn{ws: ws, local: local, remote: remote, done: make(chan struct{}), ctx: ctx, cancel: cancel}
+	c := &flowConn{ws: ws, local: local, remote: remote, done: make(chan struct{}), ctx: ctx, cancel: cancel, active: time.Now()}
 	c.cond = sync.NewCond(&c.mu)
 	go c.readLoop()
+	go c.closeWhenIdle()
 	go func() {
 		<-ctx.Done()
 		c.Close()
 	}()
 	return c
+}
+
+// closeWhenIdle closes the conn once no bytes have crossed for
+// [streamIdle].
+func (c *flowConn) closeWhenIdle() {
+	t := time.NewTimer(streamIdle)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-t.C:
+		}
+		c.mu.Lock()
+		idle := time.Since(c.active)
+		c.mu.Unlock()
+		if idle >= streamIdle {
+			c.Close()
+			return
+		}
+		t.Reset(streamIdle - idle)
+	}
 }
 
 // readLoop reads messages until the WebSocket fails: binary messages are
@@ -91,6 +124,9 @@ func (c *flowConn) readLoop() {
 			c.readErr = err
 			c.cond.Broadcast()
 			c.mu.Unlock()
+			// A WebSocket that cannot be read carries no more acks, so a
+			// writer would wait for good. Close it.
+			c.Close()
 			return
 		}
 		switch typ {
@@ -103,6 +139,7 @@ func (c *flowConn) readLoop() {
 				return
 			}
 			c.pending = append(c.pending, msg...)
+			c.active = time.Now()
 		case websocket.MessageText:
 			n, ok := parseAck(string(msg))
 			if !ok || n > c.sent || n < c.acked {
@@ -113,6 +150,7 @@ func (c *flowConn) readLoop() {
 				return
 			}
 			c.acked = n
+			c.active = time.Now()
 		}
 		c.cond.Broadcast()
 		c.mu.Unlock()
@@ -158,6 +196,12 @@ func (c *flowConn) Read(b []byte) (int, error) {
 func (c *flowConn) Write(b []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.mu.Lock()
+	wdl := c.wdl
+	c.mu.Unlock()
+	if !wdl.IsZero() && !time.Now().Before(wdl) {
+		return 0, timeoutError{}
+	}
 	written := 0
 	for len(b) > 0 {
 		chunk := b[:min(len(b), streamMessage)]
@@ -179,8 +223,25 @@ func (c *flowConn) Write(b []byte) (int, error) {
 			c.wait(c.wdl)
 		}
 		c.sent += int64(len(chunk))
+		c.active = time.Now()
+		wdl := c.wdl
 		c.mu.Unlock()
-		if err := c.ws.Write(c.ctx, websocket.MessageBinary, chunk); err != nil {
+		ctx, cancel := c.ctx, context.CancelFunc(func() {})
+		if !wdl.IsZero() {
+			ctx, cancel = context.WithDeadline(c.ctx, wdl)
+		}
+		err := c.ws.Write(ctx, websocket.MessageBinary, chunk)
+		cancel()
+		if err != nil {
+			c.mu.Lock()
+			closed := c.closed
+			c.mu.Unlock()
+			if closed {
+				return written, net.ErrClosed
+			}
+			if !wdl.IsZero() && !time.Now().Before(wdl) {
+				return written, timeoutError{}
+			}
 			return written, trace.Wrap(err)
 		}
 		written += len(chunk)
@@ -212,8 +273,19 @@ func (c *flowConn) Close() error {
 		c.closed = true
 		c.cond.Broadcast()
 		c.mu.Unlock()
+		// Close before cancelling: cancelling ctx makes the WebSocket
+		// drop the connection with no close frame, which the edge would
+		// see as a network drop.
+		closed := make(chan struct{})
+		go func() {
+			c.ws.Close(websocket.StatusNormalClosure, "")
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-time.After(closeTimeout):
+		}
 		c.cancel()
-		c.ws.Close(websocket.StatusNormalClosure, "")
 		close(c.done)
 	})
 	return nil

@@ -1122,7 +1122,7 @@ func TestApplyAuthCalloutMode(t *testing.T) {
 		},
 		{
 			name:     "on_demand",
-			yaml:     callout + "\n  callout_mode: on_demand",
+			yaml:     callout + "\n  callout_mode: on_demand\nproxy_service:\n  enabled: false",
 			wantMode: servicecfg.CalloutModeOnDemand,
 			wantErr:  "",
 		},
@@ -1131,6 +1131,12 @@ func TestApplyAuthCalloutMode(t *testing.T) {
 			yaml:     "callout_mode: on_demand",
 			wantMode: "",
 			wantErr:  "requires callout_to",
+		},
+		{
+			name:     "on_demand with a proxy",
+			yaml:     callout + "\n  callout_mode: on_demand\nproxy_service:\n  enabled: true",
+			wantMode: "",
+			wantErr:  "cannot be used with proxy_service",
 		},
 		{
 			name:     "unknown",
