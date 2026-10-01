@@ -77,7 +77,7 @@ func run(authAddr, userIdentity, proxyIdentity, user, app, publicAddr, cluster, 
 	defer asUser.Close()
 
 	// The response carries no private key, so the proxy reads the session
-	// back below.
+	// back.
 	created, err := asUser.CreateAppSession(ctx, &proto.CreateAppSessionRequest{
 		Username:    user,
 		PublicAddr:  publicAddr,

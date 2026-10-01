@@ -29,7 +29,7 @@
 // Auth is verified with -ca-pin or -ca-path. -insecure joins without
 // verifying auth, for a loopback auth only.
 //
-// The directory receives key.pem (PKCS #8), key (OpenSSH), ssh-cert.pub,
+// The directory receives key.pem (PKCS#8), key (OpenSSH), ssh-cert.pub,
 // tls.crt, tls-ca.crt and ssh-ca.pub.
 package main
 

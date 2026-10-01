@@ -47,7 +47,7 @@ const (
 	maxPendingRead = 8 << 20
 	// streamIdle closes a stream that has carried no bytes either way for
 	// this long, so that a proxy that stops acking or never closes cannot
-	// keep a stream and its goroutines forever. The edge closes idle
+	// keep a stream and its goroutines forever. The proxy closes idle
 	// streams after 30 seconds.
 	streamIdle = 2 * time.Minute
 	// closeTimeout bounds the WebSocket close handshake.

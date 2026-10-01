@@ -72,6 +72,8 @@ func (l *listener) acceptTCP() {
 	}
 }
 
+// acceptPool forwards every stream of the pool until the pool or the
+// listener is closed.
 func (l *listener) acceptPool() {
 	for {
 		c, err := l.pool.Accept()

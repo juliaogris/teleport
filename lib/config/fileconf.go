@@ -815,7 +815,7 @@ type Auth struct {
 	// proxy_protocol: off.
 	CalloutTo string `yaml:"callout_to,omitempty"`
 
-	// CalloutKeyFile is the path of the Ed25519 private key, in PEM PKCS #8
+	// CalloutKeyFile is the path of the Ed25519 private key, in PEM PKCS#8
 	// form, that signs the callout challenge. It is required with CalloutTo.
 	CalloutKeyFile string `yaml:"callout_key_file,omitempty"`
 
@@ -823,7 +823,9 @@ type Auth struct {
 	// keeps a fixed number open, and "on_demand" keeps one control socket
 	// open and opens a stream when the proxy asks for one. With
 	// "on_demand", an app service in the same process serves apps through
-	// the callout instead of a reverse tunnel. It requires CalloutTo.
+	// the callout instead of a reverse tunnel. Services in other processes,
+	// and other services in this one, still need a reverse tunnel, which an
+	// on-demand proxy does not offer. It requires CalloutTo.
 	CalloutMode string `yaml:"callout_mode,omitempty"`
 
 	// ClusterName is the name of the CA who manages this cluster

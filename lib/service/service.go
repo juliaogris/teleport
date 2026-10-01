@@ -2912,7 +2912,7 @@ func (process *TeleportProcess) initAuthService() error {
 					return nil
 				}
 				if err != nil {
-					logger.WarnContext(process.ExitContext(), "Starting auth callout before the app service is ready. App dials are refused until it is.", "waited", calloutAppsReadyTimeout)
+					logger.WarnContext(process.ExitContext(), "Starting auth callout before the app service is ready. App dials open no stream until it is.", "waited", calloutAppsReadyTimeout)
 				}
 			}
 			logger.InfoContext(process.ExitContext(), "Starting auth callout.", "url", cfg.Auth.CalloutTo.Redacted())

@@ -17,7 +17,8 @@
 // Command authcalloutdebug runs an auth callout pool outside the auth
 // process and copies each stream to auth over TCP. It is for debugging the
 // callout: if the proxy works with this command and not with the in-process
-// callout, the fault is in the hand-over to the auth listener.
+// callout, the fault is in the hand-over to the auth listener. It runs the
+// callout in pool mode only.
 //
 // Usage:
 //
@@ -55,7 +56,12 @@ func main() {
 		log.Fatal(err)
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	pool, err := authcallout.New(authcallout.Config{URL: u, Key: key, Size: *size, Logger: logger})
+	pool, err := authcallout.New(authcallout.Config{
+		URL:    u,
+		Key:    key,
+		Size:   *size,
+		Logger: logger,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -70,7 +70,9 @@
 // TLS certificate of the URL's host. The reverse tunnel also checks the
 // proxy's host certificate against the cluster's host CA, so on this path
 // the app service's own check of the user's client certificate is the
-// only Teleport check.
+// only Teleport check. The remote address of an app stream is the proxy's,
+// not the client's. App audit events record the proxy's address, and a
+// role that pins the source IP does not match it.
 package authcallout
 
 import (
@@ -119,11 +121,15 @@ const (
 type Config struct {
 	// URL is the proxy's WebSocket URL. It must pass [CheckURL].
 	URL *url.URL
-	// Key signs the challenge on every WebSocket.
+	// Key signs the challenge on each stream in [ModePool] and on the
+	// control socket in [ModeOnDemand].
 	Key ed25519.PrivateKey
-	// Size is the number of WebSockets the pool keeps open. The default is 8.
+	// Size is the number of streams the pool keeps open in [ModePool]. The
+	// default is 8.
 	Size int
-	// DialsPerMinute caps new WebSockets across the pool. The default is 60.
+	// DialsPerMinute caps new WebSockets across the pool: the streams in
+	// [ModePool], the control socket in [ModeOnDemand]. Stream dials in
+	// [ModeOnDemand] have their own budget. The default is 60.
 	DialsPerMinute int
 	// DialTimeout bounds the WebSocket handshake. The default is 30 seconds.
 	DialTimeout time.Duration
@@ -203,7 +209,7 @@ func CheckURL(u *url.URL) error {
 	return nil
 }
 
-// LoadKey reads an Ed25519 private key from a PEM file in PKCS #8 form,
+// LoadKey reads an Ed25519 private key from a PEM file in PKCS#8 form,
 // as written by `openssl genpkey -algorithm ed25519`.
 func LoadKey(path string) (ed25519.PrivateKey, error) {
 	data, err := os.ReadFile(path)
@@ -378,7 +384,8 @@ func (p *Pool) serveOne(log *slog.Logger) error {
 	}
 	log.DebugContext(p.dialCtx, "auth callout: challenge signed")
 
-	// The stream has no deadline here. It idles until the proxy uses it.
+	// The first read has no deadline, because the stream idles until the
+	// proxy uses it.
 	typ, first, err := ws.Read(p.dialCtx)
 	if err != nil {
 		return trace.Wrap(err, "waiting for first message")

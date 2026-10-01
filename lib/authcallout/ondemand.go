@@ -372,7 +372,7 @@ func (p *Pool) serveStream(kind streamKind, id string, handler func(net.Conn)) e
 	switch kind {
 	case streamApp:
 		go handler(conn)
-	default:
+	case streamAuth:
 		select {
 		case p.conns <- conn:
 		case <-p.dialCtx.Done():
