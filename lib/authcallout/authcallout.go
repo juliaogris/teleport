@@ -121,6 +121,10 @@ type Config struct {
 	Logger *slog.Logger
 	// Mode selects how the pool opens streams. The default is [ModePool].
 	Mode Mode
+
+	// pingEvery and pongTimeout time the control socket's ping in
+	// on-demand mode. Tests shorten them.
+	pingEvery, pongTimeout time.Duration
 }
 
 // CheckAndSetDefaults validates the config and sets default values.
@@ -145,6 +149,12 @@ func (c *Config) CheckAndSetDefaults() error {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
+	}
+	if c.pingEvery <= 0 {
+		c.pingEvery = defaultPingEvery
+	}
+	if c.pongTimeout <= 0 {
+		c.pongTimeout = defaultPongTimeout
 	}
 	if c.Mode != ModePool && c.Mode != ModeOnDemand {
 		return trace.BadParameter("unknown callout mode %d", c.Mode)

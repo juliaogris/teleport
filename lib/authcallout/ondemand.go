@@ -57,11 +57,11 @@ const (
 	streamDialsPerMinute = 120
 )
 
-// pingEvery is how often the control socket sends "ping", and pongTimeout
-// is how long it then waits for "pong". Tests shorten them.
-var (
-	pingEvery   = 30 * time.Second
-	pongTimeout = 10 * time.Second
+const (
+	// defaultPingEvery is how often the control socket sends "ping", and
+	// defaultPongTimeout how long it then waits for "pong".
+	defaultPingEvery   = 30 * time.Second
+	defaultPongTimeout = 10 * time.Second
 )
 
 // streamKind is the kind of stream the proxy asks for.
@@ -186,7 +186,7 @@ func (p *Pool) serveControl(log *slog.Logger) error {
 // ping writes "ping" every [pingEvery] and returns an error when a "pong"
 // is overdue.
 func (p *Pool) ping(ctx context.Context, ws *websocket.Conn, lastPong *atomic.Int64) error {
-	t := time.NewTicker(pingEvery)
+	t := time.NewTicker(p.cfg.pingEvery)
 	defer t.Stop()
 	for {
 		select {
@@ -195,7 +195,7 @@ func (p *Pool) ping(ctx context.Context, ws *websocket.Conn, lastPong *atomic.In
 		case <-t.C:
 		}
 		sent := time.Now()
-		wctx, cancel := context.WithTimeout(ctx, pongTimeout)
+		wctx, cancel := context.WithTimeout(ctx, p.cfg.pongTimeout)
 		err := ws.Write(wctx, websocket.MessageText, []byte("ping"))
 		cancel()
 		if err != nil {
@@ -204,11 +204,11 @@ func (p *Pool) ping(ctx context.Context, ws *websocket.Conn, lastPong *atomic.In
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(pongTimeout):
+		case <-time.After(p.cfg.pongTimeout):
 		}
 		if time.Unix(0, lastPong.Load()).Before(sent) {
 			ws.CloseNow()
-			return trace.ConnectionProblem(nil, "no pong within %v", pongTimeout)
+			return trace.ConnectionProblem(nil, "no pong within %v", p.cfg.pongTimeout)
 		}
 	}
 }
@@ -270,7 +270,7 @@ func (p *Pool) serveStream(kind streamKind, id string, handler func(net.Conn)) e
 	}
 	ws.SetReadLimit(readLimit)
 	// Streams outlive Stop, so the conn takes ctx, not dialCtx.
-	conn := newConn(p.ctx, ws, nil, local, remote)
+	conn := newFlowConn(p.ctx, ws, local, remote)
 	switch kind {
 	case streamApp:
 		go handler(conn)

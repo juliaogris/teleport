@@ -119,8 +119,12 @@ func (e *lazyEdge) noStream(t *testing.T, within time.Duration) {
 	}
 }
 
-func newOnDemandPool(t *testing.T, u *url.URL, key ed25519.PrivateKey) *Pool {
-	p, err := New(Config{URL: u, Key: key, Mode: ModeOnDemand, DialsPerMinute: 6000})
+func newOnDemandPool(t *testing.T, u *url.URL, key ed25519.PrivateKey, opts ...func(*Config)) *Pool {
+	cfg := Config{URL: u, Key: key, Mode: ModeOnDemand, DialsPerMinute: 6000}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	p, err := New(cfg)
 	require.NoError(t, err)
 	p.Start()
 	t.Cleanup(func() { p.Close() })
@@ -264,14 +268,12 @@ func TestOnDemandBadMessageClosesControl(t *testing.T) {
 }
 
 func TestOnDemandPing(t *testing.T) {
-	oldEvery, oldTimeout := pingEvery, pongTimeout
-	pingEvery, pongTimeout = 50*time.Millisecond, 200*time.Millisecond
-	t.Cleanup(func() { pingEvery, pongTimeout = oldEvery, oldTimeout })
+	fast := func(c *Config) { c.pingEvery, c.pongTimeout = 50*time.Millisecond, 200*time.Millisecond }
 
 	t.Run("pong keeps the socket open", func(t *testing.T) {
 		pub, priv := newKey(t)
 		e := newLazyEdge(t, pub)
-		newOnDemandPool(t, e.url(t), priv)
+		newOnDemandPool(t, e.url(t), priv, fast)
 		ctl := e.control(t)
 		for range 3 {
 			typ, msg, err := ctl.Read(t.Context())
@@ -285,7 +287,7 @@ func TestOnDemandPing(t *testing.T) {
 	t.Run("missing pong closes the socket", func(t *testing.T) {
 		pub, priv := newKey(t)
 		e := newLazyEdge(t, pub)
-		newOnDemandPool(t, e.url(t), priv)
+		newOnDemandPool(t, e.url(t), priv, fast)
 		ctl := e.control(t)
 		requireClosed(t, ctl)
 		e.control(t)
