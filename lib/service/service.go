@@ -21,6 +21,7 @@
 package service
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -2905,14 +2906,15 @@ func (process *TeleportProcess) initAuthService() error {
 			// bounded so that an app service that never starts does not
 			// keep auth off the proxy.
 			if calloutPool.Mode() == authcallout.ModeOnDemand && cfg.Apps.Enabled {
-				appsCtx, cancel := context.WithTimeout(process.GracefulExitContext(), calloutAppsReadyTimeout)
+				timeout := cmp.Or(cfg.Testing.CalloutAppsReadyTimeout, calloutAppsReadyTimeout)
+				appsCtx, cancel := context.WithTimeout(process.GracefulExitContext(), timeout)
 				_, err := process.WaitForEvent(appsCtx, AppsReady)
 				cancel()
 				if process.GracefulExitContext().Err() != nil {
 					return nil
 				}
 				if err != nil {
-					logger.WarnContext(process.ExitContext(), "Starting auth callout before the app service is ready. App dials open no stream until it is.", "waited", calloutAppsReadyTimeout)
+					logger.WarnContext(process.ExitContext(), "Starting auth callout before the app service is ready. App dials open no stream until it is.", "waited", timeout)
 				}
 			}
 			logger.InfoContext(process.ExitContext(), "Starting auth callout.", "url", cfg.Auth.CalloutTo.Redacted())

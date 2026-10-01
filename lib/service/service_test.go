@@ -3105,3 +3105,58 @@ func TestAuthCalloutOnDemandServesAuthAndApps(t *testing.T) {
 		require.Contains(c, names, "bench")
 	}, 30*time.Second, 500*time.Millisecond, "the app service stopped heartbeating its app")
 }
+
+func TestAuthCalloutOnDemandStartsWithoutApps(t *testing.T) {
+	t.Parallel()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(priv)
+	require.NoError(t, err)
+	keyPath := filepath.Join(t.TempDir(), "callout.pem")
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})
+	require.NoError(t, os.WriteFile(keyPath, keyPEM, 0o600))
+	controls := make(chan *websocket.Conn, 4)
+	streams := make(chan *websocket.Conn, 4)
+
+	dataDir := makeTempDir(t)
+	cfg := servicecfg.MakeDefaultConfig()
+	cfg.DataDir = dataDir
+	cfg.SetAuthServerAddress(utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"})
+	cfg.Auth.Enabled = true
+	cfg.Proxy.Enabled = false
+	cfg.SSH.Enabled = false
+	cfg.DebugService.Enabled = false
+	cfg.Auth.StorageConfig.Params["path"] = dataDir
+	cfg.Auth.ListenAddr = utils.NetAddr{AddrNetwork: "tcp", Addr: "127.0.0.1:0"}
+	cfg.Auth.CalloutTo = onDemandEdge(t, pub, controls, streams)
+	cfg.Auth.CalloutKeyFile = keyPath
+	cfg.Auth.CalloutMode = servicecfg.CalloutModeOnDemand
+	// An app with no public address needs a proxy to take one from, and
+	// there is none, so the app service never starts.
+	cfg.Apps.Enabled = true
+	cfg.Apps.Apps = []servicecfg.App{{Name: "bench", URI: "http://127.0.0.1:1"}}
+	cfg.Testing.CalloutAppsReadyTimeout = 2 * time.Second
+	cfg.CircuitBreakerConfig = breaker.NoopBreakerConfig()
+
+	process, err := NewTeleport(cfg)
+	require.NoError(t, err)
+	require.NoError(t, process.Start())
+	t.Cleanup(func() {
+		process.Close()
+		process.Wait()
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	select {
+	case ws := <-controls:
+		ws.CloseNow()
+	case <-ctx.Done():
+		t.Fatal("no control socket within 60s")
+	}
+	// WaitForEvent returns an event already broadcast whatever its context.
+	readyCtx, cancelReady := context.WithCancel(t.Context())
+	cancelReady()
+	_, err = process.WaitForEvent(readyCtx, AppsReady)
+	require.Error(t, err, "the callout must have started without AppsReady")
+}

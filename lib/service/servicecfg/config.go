@@ -330,6 +330,10 @@ type ConfigTesting struct {
 	// HTTPTransport is an optional HTTP round tripper to used in tests
 	// to mock HTTP requests to the third party services like Okta integration
 	HTTPTransport http.RoundTripper
+
+	// CalloutAppsReadyTimeout overrides how long an on-demand auth callout
+	// waits for the app service in the same process. Used in tests.
+	CalloutAppsReadyTimeout time.Duration
 }
 
 // UserMonitorConfig contains configuration for the user monitor service, which is responsible for monitoring
