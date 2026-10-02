@@ -249,7 +249,7 @@ func (p *Pool) serveControl(log *slog.Logger) error {
 		}
 	}()
 
-	code, err := p.serveDials(ctx, ws, log, &lastPong, refuses)
+	code, err := p.serveDials(ws, log, &lastPong, refuses)
 	if code != 0 {
 		closeGracefully(ws, code)
 		return trace.Wrap(err)
@@ -266,7 +266,7 @@ func (p *Pool) serveControl(log *slog.Logger) error {
 // or the proxy breaks the protocol. It returns the close status to send,
 // 1008 for a message the proxy must not send and 1011 for a failed write,
 // or 0 when the socket already failed.
-func (p *Pool) serveDials(ctx context.Context, ws *websocket.Conn, log *slog.Logger, lastPong *atomic.Int64, refuses bool) (websocket.StatusCode, error) {
+func (p *Pool) serveDials(ws *websocket.Conn, log *slog.Logger, lastPong *atomic.Int64, refuses bool) (websocket.StatusCode, error) {
 	for {
 		typ, msg, err := ws.Read(context.Background())
 		if err != nil {
