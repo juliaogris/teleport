@@ -828,6 +828,13 @@ type Auth struct {
 	// on-demand proxy does not offer. It requires CalloutTo.
 	CalloutMode string `yaml:"callout_mode,omitempty"`
 
+	// CalloutProxyAddr is the host and port that "proxy" streams from the
+	// callout connect to, for example the web listener of a proxy at home
+	// such as "127.0.0.1:3080". Auth dials only this address for them. If
+	// unset, auth refuses proxy streams. It requires callout_mode:
+	// on_demand.
+	CalloutProxyAddr string `yaml:"callout_proxy_addr,omitempty"`
+
 	// ClusterName is the name of the CA who manages this cluster
 	ClusterName ClusterName `yaml:"cluster_name,omitempty"`
 

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
 	"log/slog"
 	mathrand "math/rand/v2"
 	"net"
@@ -75,8 +76,16 @@ const (
 	// maxStreams bounds a proxy that keeps asking.
 	streamDialBurst      = 128
 	streamDialsPerMinute = 480
-	// maxStreams caps the streams open at once in on-demand mode.
+	// maxStreams caps the auth and app streams open at once in on-demand
+	// mode.
 	maxStreams = 256
+	// maxProxyStreams caps the proxy streams open at once, apart from
+	// maxStreams. A tsh session holds its proxy streams for as long as it
+	// runs, so without its own cap one client could hold every slot and
+	// stop all auth and app dials.
+	maxProxyStreams = 32
+	// proxyDialTimeout bounds the TCP dial to Config.ProxyAddr.
+	proxyDialTimeout = 10 * time.Second
 	// defaultMaxControlBackoff is the longest wait before redialing a
 	// control socket that the proxy refused or replaced, or that closed
 	// within shortControl.
@@ -101,8 +110,9 @@ const (
 type streamKind string
 
 const (
-	streamAuth streamKind = "auth"
-	streamApp  streamKind = "app"
+	streamAuth  streamKind = "auth"
+	streamApp   streamKind = "app"
+	streamProxy streamKind = "proxy"
 )
 
 // SetAppHandler sets the function that serves app streams in on-demand
@@ -284,6 +294,16 @@ func (p *Pool) serveDials(ws *websocket.Conn, log *slog.Logger, lastPong *atomic
 		if err != nil {
 			return websocket.StatusPolicyViolation, trace.Wrap(err)
 		}
+		if kind == streamProxy {
+			p.dialProxyStream(log, id, func() {
+				if refuses {
+					// A refuse after the control socket closed is lost,
+					// and the proxy's deadline covers it.
+					_ = writeControl(p.ctx, ws, "refuse "+id)
+				}
+			})
+			continue
+		}
 		if p.dialStream(log, kind, id) || !refuses {
 			continue
 		}
@@ -346,7 +366,8 @@ func (p *Pool) ping(ctx context.Context, ws *websocket.Conn, lastPong *atomic.In
 	}
 }
 
-// parseDial parses "dial auth <id>" or "dial app <id>". The id must be
+// parseDial parses "dial auth <id>", "dial app <id>" or "dial proxy <id>".
+// The id must be
 // [streamIDSize] bytes in unpadded base64url.
 func parseDial(text string) (streamKind, string, error) {
 	parts := strings.Split(text, " ")
@@ -354,7 +375,7 @@ func parseDial(text string) (streamKind, string, error) {
 		return "", "", trace.BadParameter("unexpected control message")
 	}
 	kind := streamKind(parts[1])
-	if kind != streamAuth && kind != streamApp {
+	if kind != streamAuth && kind != streamApp && kind != streamProxy {
 		return "", "", trace.BadParameter("unexpected stream kind")
 	}
 	id := parts[2]
@@ -411,13 +432,14 @@ func (p *Pool) dialStream(log *slog.Logger, kind streamKind, id string) bool {
 // dropLogs rate limits the log line for each reason a dial is dropped, so
 // that one reason cannot silence another.
 type dropLogs struct {
-	noHandler, tooMany, overBudget rate.Sometimes
+	noHandler, noProxy, tooMany, overBudget rate.Sometimes
 }
 
 // newDropLogs returns dropLogs that log each reason at most once a minute.
 func newDropLogs() dropLogs {
 	return dropLogs{
 		noHandler:  rate.Sometimes{Interval: time.Minute},
+		noProxy:    rate.Sometimes{Interval: time.Minute},
 		tooMany:    rate.Sometimes{Interval: time.Minute},
 		overBudget: rate.Sometimes{Interval: time.Minute},
 	}
@@ -453,10 +475,92 @@ func (p *Pool) serveStream(kind streamKind, id string, handler func(net.Conn)) e
 	return nil
 }
 
+// dialProxyStream connects a proxy stream to [Config.ProxyAddr]. It calls
+// refuse, at most once, when it opens no stream: when ProxyAddr is not
+// set, after [Pool.Stop], when [maxProxyStreams] are open, when the dial
+// budget is used up, or when the dial to ProxyAddr fails. The TCP dial
+// comes first, so that a home proxy that is down gets a refuse and not
+// an empty stream. It never blocks the control socket on the dial.
+func (p *Pool) dialProxyStream(log *slog.Logger, id string, refuse func()) {
+	switch {
+	case p.cfg.ProxyAddr == "":
+		p.dropLogs.noProxy.Do(func() {
+			log.WarnContext(p.dialCtx, "auth callout: proxy stream asked for, but no callout_proxy_addr is set")
+		})
+		refuse()
+		return
+	case p.dialCtx.Err() != nil:
+		refuse()
+		return
+	case p.openProxyStreams.Load() >= maxProxyStreams:
+		p.dropLogs.tooMany.Do(func() {
+			log.WarnContext(p.dialCtx, "auth callout: too many proxy streams open, dropping dials", "max_proxy_streams", maxProxyStreams)
+		})
+		refuse()
+		return
+	case !p.streamLimiters[streamProxy].Allow():
+		p.dropLogs.overBudget.Do(func() {
+			log.WarnContext(p.dialCtx, "auth callout: stream dial rate limit reached, dropping dials", "kind", streamProxy, "dials_per_minute", streamDialsPerMinute)
+		})
+		refuse()
+		return
+	}
+	p.wg.Add(1)
+	p.openProxyStreams.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer p.openProxyStreams.Add(-1)
+		dialCtx, cancel := context.WithTimeout(p.dialCtx, proxyDialTimeout)
+		target, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", p.cfg.ProxyAddr)
+		cancel()
+		if err != nil {
+			log.DebugContext(p.dialCtx, "auth callout: dialing callout_proxy_addr failed", "error", err)
+			refuse()
+			return
+		}
+		if err := p.serveProxyStream(id, target); err != nil {
+			log.DebugContext(p.dialCtx, "auth callout: stream failed", "kind", streamProxy, "error", err)
+		}
+	}()
+}
+
+// serveProxyStream opens one stream and copies its bytes to and from
+// target until either side closes. It closes target.
+func (p *Pool) serveProxyStream(id string, target net.Conn) error {
+	defer target.Close()
+	header := http.Header{StreamIDHeader: {id}, StreamHeader: {StreamAcks}}
+	ws, local, remote, err := p.dialWithAddrs(p.modeURL("stream"), header)
+	if err != nil {
+		return trace.Wrap(err, "dialing stream")
+	}
+	ws.SetReadLimit(readLimit)
+	conn := newFlowConn(p.ctx, ws, local, remote, p.cfg.streamIdle)
+	defer conn.Close()
+
+	copied := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(target, conn)
+		copied <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(conn, target)
+		copied <- struct{}{}
+	}()
+	// Either direction ending ends the stream. TLS inside carries its own
+	// close_notify, so a half-close would add nothing.
+	select {
+	case <-copied:
+	case <-conn.done:
+	case <-p.ctx.Done():
+		conn.closeWith(websocket.StatusGoingAway)
+	}
+	return nil
+}
+
 // newStreamLimiters returns one stream dial limiter per stream kind.
 func newStreamLimiters() map[streamKind]*rate.Limiter {
 	limiters := map[streamKind]*rate.Limiter{}
-	for _, kind := range []streamKind{streamAuth, streamApp} {
+	for _, kind := range []streamKind{streamAuth, streamApp, streamProxy} {
 		limiters[kind] = rate.NewLimiter(rate.Limit(float64(streamDialsPerMinute)/60), streamDialBurst)
 	}
 	return limiters

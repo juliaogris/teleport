@@ -955,6 +955,15 @@ func applyAuthConfig(fc *FileConfig, cfg *servicecfg.Config) error {
 		want := fmt.Sprintf("%q or %q", servicecfg.CalloutModePool, servicecfg.CalloutModeOnDemand)
 		return trace.BadParameter("auth_service.callout_mode must be %s, got %q", want, fc.Auth.CalloutMode)
 	}
+	if fc.Auth.CalloutProxyAddr != "" {
+		if cfg.Auth.CalloutMode != servicecfg.CalloutModeOnDemand {
+			return trace.BadParameter("auth_service.callout_proxy_addr requires callout_mode: on_demand")
+		}
+		if err := authcallout.CheckProxyAddr(fc.Auth.CalloutProxyAddr); err != nil {
+			return trace.Wrap(err, "auth_service.callout_proxy_addr")
+		}
+		cfg.Auth.CalloutProxyAddr = fc.Auth.CalloutProxyAddr
+	}
 
 	if fc.Auth.ListenAddress != "" {
 		addr, err := utils.ParseHostPortAddr(fc.Auth.ListenAddress, int(defaults.AuthListenPort))

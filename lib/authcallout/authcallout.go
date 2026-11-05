@@ -43,13 +43,14 @@
 //
 //  1. The pool dials the URL with the query parameter mode=control and
 //     answers the same challenge as above.
-//  2. The proxy sends text messages "dial auth <id>" or "dial app <id>",
-//     where <id> is 32 random bytes in unpadded base64url. Any other
-//     message closes the control socket. For a dial it opens no stream
-//     for, the pool answers "refuse <id>" if the proxy's response to the
-//     control request carried the header "Sallyport-Control: refuse".
-//     Without that header the pool answers nothing, and the proxy learns
-//     of the dropped dial from its own deadline.
+//  2. The proxy sends text messages "dial auth <id>", "dial app <id>" or
+//     "dial proxy <id>", where <id> is 32 random bytes in unpadded
+//     base64url. Any other message closes the control socket. For a dial
+//     it opens no stream for, the pool answers "refuse <id>" if the
+//     proxy's response to the control request carried the header
+//     "Sallyport-Control: refuse". Without that header the pool answers
+//     nothing, and the proxy learns of the dropped dial from its own
+//     deadline.
 //  3. The pool sends the text "ping" every 30 seconds and closes the socket
 //     when no "pong" comes back within 10 seconds. A proxy can answer it
 //     without waking up.
@@ -57,7 +58,9 @@
 //     the Sallyport-Stream-Id header. There is no challenge on a stream:
 //     the proxy accepts only an id it sent on the control socket, once.
 //     An auth stream goes to [Pool.Accept]. An app stream goes to the
-//     handler set with [Pool.SetAppHandler].
+//     handler set with [Pool.SetAppHandler]. A proxy stream is copied to
+//     and from a TCP connection to [Config.ProxyAddr], which the pool
+//     dials before the stream. When that dial fails, the pool refuses.
 //  5. Binary messages on a stream carry its bytes. Each end sends the text
 //     "ack <n>" after every 256 KiB it has passed on, where <n> is the
 //     total so far, and keeps at most 1 MiB unacknowledged. The stream
@@ -79,6 +82,12 @@
 // only Teleport check. The remote address of an app stream is the proxy's,
 // not the client's. App audit events record the proxy's address, and a
 // role that pins the source IP does not match it.
+//
+// A proxy stream carries whatever the proxy sends to [Config.ProxyAddr],
+// with no check by the pool. It hands the proxy the same reach as a TCP
+// port forward to that address, so ProxyAddr must be a listener that
+// authenticates its own clients, such as a Teleport proxy's web listener.
+// The remote address that ProxyAddr sees is the pool's.
 package authcallout
 
 import (
@@ -96,6 +105,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -143,6 +153,11 @@ type Config struct {
 	Logger *slog.Logger
 	// Mode selects how the pool opens streams. The default is [ModePool].
 	Mode Mode
+	// ProxyAddr is the host and port that proxy streams connect to in
+	// [ModeOnDemand], for example the home proxy's web listener. The pool
+	// dials only this address for a proxy stream, never one the proxy
+	// names. If empty, the pool refuses proxy streams.
+	ProxyAddr string
 
 	// pingEvery and pongTimeout time the control socket's ping in
 	// on-demand mode. Tests shorten them.
@@ -197,6 +212,14 @@ func (c *Config) CheckAndSetDefaults() error {
 	if c.Mode != ModePool && c.Mode != ModeOnDemand {
 		return trace.BadParameter("unknown callout mode %d", c.Mode)
 	}
+	if c.ProxyAddr != "" {
+		if c.Mode != ModeOnDemand {
+			return trace.BadParameter("callout proxy address requires on-demand mode")
+		}
+		if err := CheckProxyAddr(c.ProxyAddr); err != nil {
+			return trace.Wrap(err)
+		}
+	}
 	return nil
 }
 
@@ -217,6 +240,22 @@ func CheckURL(u *url.URL) error {
 	addr, err := netip.ParseAddr(host)
 	if err != nil || (!addr.IsLoopback() && !addr.IsPrivate()) {
 		return trace.BadParameter("callout URL %q uses ws:// with a host that is not a private address", u.Redacted())
+	}
+	return nil
+}
+
+// CheckProxyAddr returns an error unless addr is a host and a port from 1
+// to 65535.
+func CheckProxyAddr(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return trace.BadParameter("callout proxy address %q: %v", addr, err)
+	}
+	if host == "" {
+		return trace.BadParameter("callout proxy address %q has no host", addr)
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return trace.BadParameter("callout proxy address %q has an invalid port", addr)
 	}
 	return nil
 }
@@ -272,9 +311,11 @@ type Pool struct {
 	// These fields are used in on-demand mode only.
 	streamLimiters map[streamKind]*rate.Limiter
 	openStreams    atomic.Int32
-	appHandler     atomic.Pointer[func(net.Conn)]
-	dropLogs       dropLogs
-	controlLogs    controlLogs
+	// openProxyStreams counts proxy streams, apart from openStreams.
+	openProxyStreams atomic.Int32
+	appHandler       atomic.Pointer[func(net.Conn)]
+	dropLogs         dropLogs
+	controlLogs      controlLogs
 }
 
 // New returns a pool that does not dial until [Pool.Start].

@@ -1160,6 +1160,61 @@ func TestApplyAuthCalloutMode(t *testing.T) {
 	}
 }
 
+func TestApplyAuthCalloutProxyAddr(t *testing.T) {
+	const onDemand = "proxy_protocol: off\n  callout_to: wss://teleport.example.com/tunnel/auth\n  callout_key_file: /etc/teleport/callout.pem\n  callout_mode: on_demand"
+	const noProxy = "\nproxy_service:\n  enabled: false"
+	for _, tc := range []struct {
+		name     string
+		yaml     string
+		wantAddr string
+		wantErr  string
+	}{
+		{
+			name:     "unset",
+			yaml:     onDemand + noProxy,
+			wantAddr: "",
+		},
+		{
+			name:     "set",
+			yaml:     onDemand + "\n  callout_proxy_addr: 127.0.0.1:3080" + noProxy,
+			wantAddr: "127.0.0.1:3080",
+		},
+		{
+			name:    "pool mode",
+			yaml:    "proxy_protocol: off\n  callout_to: wss://teleport.example.com/tunnel/auth\n  callout_key_file: /etc/teleport/callout.pem\n  callout_proxy_addr: 127.0.0.1:3080",
+			wantErr: "requires callout_mode: on_demand",
+		},
+		{
+			name:    "no callout",
+			yaml:    "callout_proxy_addr: 127.0.0.1:3080",
+			wantErr: "requires callout_mode: on_demand",
+		},
+		{
+			name:    "no port",
+			yaml:    onDemand + "\n  callout_proxy_addr: 127.0.0.1" + noProxy,
+			wantErr: "callout_proxy_addr",
+		},
+		{
+			name:    "bad port",
+			yaml:    onDemand + "\n  callout_proxy_addr: 127.0.0.1:0" + noProxy,
+			wantErr: "invalid port",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conf, err := ReadConfig(bytes.NewBufferString("auth_service:\n  enabled: true\n  " + tc.yaml + "\n"))
+			require.NoError(t, err)
+			cfg := servicecfg.MakeDefaultConfig()
+			err = ApplyFileConfig(conf, cfg)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantAddr, cfg.Auth.CalloutProxyAddr)
+		})
+	}
+}
+
 // TestApplyCustomAuthPreference makes sure that if the auth file configuration
 // has a `cluster_auth_preference` field, then it will have the origin label as
 // config-file.

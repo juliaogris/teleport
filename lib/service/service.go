@@ -2835,10 +2835,11 @@ func (process *TeleportProcess) initAuthService() error {
 			mode = authcallout.ModeOnDemand
 		}
 		calloutPool, err = authcallout.New(authcallout.Config{
-			URL:    cfg.Auth.CalloutTo,
-			Key:    key,
-			Logger: logger,
-			Mode:   mode,
+			URL:       cfg.Auth.CalloutTo,
+			Key:       key,
+			Logger:    logger,
+			Mode:      mode,
+			ProxyAddr: cfg.Auth.CalloutProxyAddr,
 		})
 		if err != nil {
 			listener.Close()

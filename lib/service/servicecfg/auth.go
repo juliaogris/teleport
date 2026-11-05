@@ -59,6 +59,10 @@ type AuthConfig struct {
 	// default) or CalloutModeOnDemand.
 	CalloutMode string
 
+	// CalloutProxyAddr is the host and port that proxy streams from the
+	// callout connect to. If empty, auth refuses proxy streams.
+	CalloutProxyAddr string
+
 	// Authorities is a set of trusted certificate authorities
 	// that will be added by this auth server on the first start
 	Authorities []types.CertAuthority
